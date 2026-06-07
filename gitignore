@@ -1,0 +1,19 @@
+# Build outputs
+*.exe
+*.o
+*.res
+sdrtrim
+sdrtrimgui
+
+# Settings file (user-specific)
+sdrtrimgui.ini
+
+# IDE / editor
+.vscode/
+*.code-workspace
+*.swp
+*~
+
+# OS
+Thumbs.db
+.DS_Store

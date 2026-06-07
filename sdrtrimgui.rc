@@ -1,0 +1,7 @@
+/* sdrtrimgui.rc - resource file for SDR Trim GUI */
+
+/* Embed the manifest so Common Controls v6 (visual styles) loads */
+#define RT_MANIFEST  24
+#define CREATEPROCESS_MANIFEST_RESOURCE_ID  1
+
+CREATEPROCESS_MANIFEST_RESOURCE_ID RT_MANIFEST "sdrtrimgui.manifest"
