@@ -126,7 +126,7 @@ Features:
 
 See the user guide (`sdr_trim_user_guide.docx`) for full version history.
 
-Current version: **1.3**
+Current version: **1.4**
 
 ## License
 

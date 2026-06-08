@@ -328,9 +328,11 @@ static int parse_sdruno_filename(const char *path, RecInfo *r)
     const char *bn = strrchr(stem, '\\');
     if(!bn) bn = strrchr(stem, '/');
     if(bn) bn++; else bn = stem;
-    int yy=0,mo=0,dd=0,hh=0,mi=0,ss=0,cf_khz=0,ch=1;
-    if(sscanf(bn,"SDRuno_%4d%2d%2d_%2d%2d%2d_%dkHz_ch%d",
-              &yy,&mo,&dd,&hh,&mi,&ss,&cf_khz,&ch)>=7){
+    int yy=0,mo=0,dd=0,hh=0,mi=0,ss=0,cf_khz=0;
+    if(sscanf(bn,"SDRuno_%4d%2d%2d_%2d%2d%2dZ_%dkHz",
+              &yy,&mo,&dd,&hh,&mi,&ss,&cf_khz)>=7 ||
+       sscanf(bn,"SDRuno_%4d%2d%2d_%2d%2d%2d_%dkHz",
+              &yy,&mo,&dd,&hh,&mi,&ss,&cf_khz)>=7){
         r->year=yy; r->month=mo; r->day=dd;
         r->hour=hh; r->minute=mi; r->second=ss;
         r->centre_freq_hz=cf_khz*1000;
@@ -704,12 +706,13 @@ static void build_wavviewdx_filename(char *out, size_t sz,
 
 static void build_sdruno_filename(char *out, size_t sz,
     int year,int month,int day,int hh,int mm,int ss,
-    int freq_hz,OutputChan ochan)
+    int freq_hz, OutputChan ochan __attribute__((unused)))
 {
     int kHz=freq_hz/1000;
-    int ch=(ochan==OUT_CH2)?2:1;
-    snprintf(out,sz,"SDRuno_%04d%02d%02d_%02d%02d%02d_%dkHz_ch%d.wav",
-             year,month,day,hh,mm,ss,kHz,ch);
+    /* SDRuno filename format: SDRuno_yyyymmdd_hhmmssZ_xxxxkHz.wav
+       Matches SDRuno's own recording format exactly. */
+    snprintf(out,sz,"SDRuno_%04d%02d%02d_%02d%02d%02dZ_%dkHz.wav",
+             year,month,day,hh,mm,ss,kHz);
 }
 
 static void build_sdrconnect_filename(char *out, size_t sz,
@@ -811,7 +814,11 @@ static int64_t write_wav_header(FILE *fp,
        SDR Connect: RIFF(12) + JUNK(8+28) + fmt(8+16) + data(8) = 80
     */
     uint64_t overhead = (out_fmt==FMT_SDRUNO) ? 216 : 80;
-    int use_rf64 = (out_data_bytes >= 0xFFFFFFFFULL - overhead);
+    /* SDRuno does not support RF64. For SDRuno format, use RIFF with
+     * 0xFFFFFFFF clamped size (SDRuno's own behaviour for large files).
+     * Only use RF64 for SDR Connect format if it exceeds 4GB. */
+    int use_rf64 = (out_fmt==FMT_SDRCONNECT) &&
+                   (out_data_bytes >= 0xFFFFFFFFULL - overhead);
     *use_rf64_out = use_rf64;
     *ds64_pos_out = -1;
 
@@ -819,7 +826,10 @@ static int64_t write_wav_header(FILE *fp,
         *ds64_pos_out = write_rf64_ds64(fp);
     } else {
         fwrite("RIFF",1,4,fp);
-        uint32_t riff_sz=(uint32_t)(overhead-8+out_data_bytes);
+        /* Clamp to 0xFFFFFFFF for large files (matches SDRuno's own behaviour) */
+        uint64_t riff_total = overhead - 8 + out_data_bytes;
+        uint32_t riff_sz = (riff_total > 0xFFFFFFFFULL) ?
+                           0xFFFFFFFFU : (uint32_t)riff_total;
         fwrite(&riff_sz,4,1,fp);
         fwrite("WAVE",1,4,fp);
     }
@@ -1495,6 +1505,15 @@ int main(int argc, char *argv[])
     int64_t ds64_pos=-1, data_sz32_pos=-1;
     int use_rf64=0;
     uint64_t out_data_bytes=out_frames*(uint64_t)out_ch*2;
+
+    /* Warn if SDR Connect output would require RF64 */
+    if(out_fmt==FMT_SDRCONNECT){
+        uint64_t overhead=80;
+        if(out_data_bytes >= 0xFFFFFFFFULL-overhead){
+            fprintf(stderr,
+                "Warning: SDR Connect output exceeds 4 GB and will be written as RF64.\n");
+        }
+    }
 
     int end_yy,end_mm2,end_dd,end_hh2,end_mi2,end_ss2;
     unix_to_utc(end_epoch,&end_yy,&end_mm2,&end_dd,&end_hh2,&end_mi2,&end_ss2);

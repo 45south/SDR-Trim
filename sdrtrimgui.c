@@ -330,6 +330,8 @@ static BOOL probe_file(const wchar_t *path,FileInfo *fi)
                     wchar_t stem[MAX_PATH]; wcsncpy(stem,bn,MAX_PATH-1);
                     wchar_t *dot=wcsrchr(stem,L'.'); if(dot)*dot=L'\0';
                     int cf_khz=0;
+                    swscanf(stem,L"SDRuno_%4d%2d%2d_%2d%2d%2dZ_%dkHz",
+                        &fi->year,&fi->mon,&fi->day,&fi->hour,&fi->min,&fi->sec,&cf_khz) ||
                     swscanf(stem,L"SDRuno_%4d%2d%2d_%2d%2d%2d_%dkHz",
                         &fi->year,&fi->mon,&fi->day,&fi->hour,&fi->min,&fi->sec,&cf_khz);
                     if(cf_khz>0&&fi->centre_hz==0) fi->centre_hz=cf_khz*1000;
@@ -361,6 +363,8 @@ static BOOL probe_file(const wchar_t *path,FileInfo *fi)
             wchar_t stem[MAX_PATH]; wcsncpy(stem,bn,MAX_PATH-1);
             wchar_t *dot=wcsrchr(stem,L'.'); if(dot)*dot=L'\0';
             int cf_khz=0;
+            swscanf(stem,L"SDRuno_%4d%2d%2d_%2d%2d%2dZ_%dkHz",
+                &fi->year,&fi->mon,&fi->day,&fi->hour,&fi->min,&fi->sec,&cf_khz) ||
             swscanf(stem,L"SDRuno_%4d%2d%2d_%2d%2d%2d_%dkHz",
                 &fi->year,&fi->mon,&fi->day,&fi->hour,&fi->min,&fi->sec,&cf_khz);
             if(cf_khz>0&&fi->centre_hz==0) fi->centre_hz=cf_khz*1000;
@@ -426,14 +430,13 @@ static BOOL predict_outfile(const wchar_t *inpath,wchar_t *outfile,int n)
         if(bw_khz>0&&sr>0){ int D=sr/(bw_khz*1000); if(D<1)D=1; sr=sr/D; }
     }
     wchar_t name[MAX_PATH];
-    int ch_num=IsDlgButtonChecked(g_hwnd,ID_CHAN_CH2)?2:1;
     switch(out_fmt){
     case 0: _snwprintf(name,MAX_PATH,L"%04d%02d%02d_%02d%02d%02d%d_%dkHz.raw",
                 sy,smo,sd,sh,smi,0,fi.utc_digit,cf/1000); break;
     case 1: _snwprintf(name,MAX_PATH,L"iq_pcm16_ch%d_cf%d_sr%d_dt%04d%02d%02d-%02d%02d%02d.raw",
                 dual_out?2:1,cf,sr,sy,smo,sd,sh,smi,0); break;
-    case 2: _snwprintf(name,MAX_PATH,L"SDRuno_%04d%02d%02d_%02d%02d%02d_%dkHz_ch%d.wav",
-                sy,smo,sd,sh,smi,0,cf/1000,ch_num); break;
+    case 2: _snwprintf(name,MAX_PATH,L"SDRuno_%04d%02d%02d_%02d%02d%02dZ_%dkHz.wav",
+                sy,smo,sd,sh,smi,0,cf/1000); break;
     case 3: _snwprintf(name,MAX_PATH,L"SDRconnect_IQ_%04d%02d%02d_%02d%02d%02d_%dHZ.wav",
                 sy,smo,sd,sh,smi,0,cf); break;
     default: return FALSE;
@@ -556,6 +559,63 @@ static void update_run_batch_button(void)
     EnableWindow(GetDlgItem(g_hwnd,ID_RUN_BATCH), any_runnable && g_job_count>0);
 }
 
+
+/* Estimate output data bytes for current settings.
+   Returns 0 if unknown. Used to check RF64 threshold. */
+static uint64_t estimate_output_bytes(const wchar_t *input, const FileInfo *fi)
+{
+    if(!input[0] || fi->fmt<0 || fi->sample_rate<=0) return 0;
+
+    /* Get input file size */
+    WIN32_FILE_ATTRIBUTE_DATA fa;
+    if(!GetFileAttributesExW(input,GetFileExInfoStandard,&fa)) return 0;
+    uint64_t fsz=((uint64_t)fa.nFileSizeHigh<<32)|fa.nFileSizeLow;
+
+    /* Bytes per frame in input */
+    int in_ch = fi->dual ? 4 : 2;
+    uint64_t in_data = fsz; /* approximate — close enough for threshold check */
+
+    /* Output channels */
+    int out_ch = (IsDlgButtonChecked(g_hwnd,ID_CHAN_CH1)||
+                  IsDlgButtonChecked(g_hwnd,ID_CHAN_CH2)||!fi->dual) ? 2 : 4;
+
+    /* Scale by channel ratio */
+    uint64_t out_data = (in_data / (uint64_t)in_ch) * (uint64_t)out_ch;
+
+    /* Scale by trim ratio if trimming */
+    if(IsDlgButtonChecked(g_hwnd,ID_MODE_TRIM)){
+        wchar_t sb[8]={0},eb[8]={0}; int sh=0,sm=0,eh=0,em=0;
+        GetWindowTextW(GetDlgItem(g_hwnd,ID_START_EDIT),sb,8);
+        GetWindowTextW(GetDlgItem(g_hwnd,ID_END_EDIT),  eb,8);
+        if(wcslen(sb)==4&&wcslen(eb)==4){
+            swscanf(sb,L"%2d%2d",&sh,&sm);
+            swscanf(eb,L"%2d%2d",&eh,&em);
+            int start_min=sh*60+sm, end_min=eh*60+em;
+            if(end_min<=start_min) end_min+=24*60; /* midnight crossing */
+            int trim_min=end_min-start_min;
+            /* Total recording duration in minutes */
+            uint64_t rec_bytes = in_data;
+            int bytes_per_sec = fi->sample_rate * in_ch * 2;
+            int total_sec = (bytes_per_sec>0)?(int)(rec_bytes/bytes_per_sec):0;
+            if(total_sec>0){
+                int total_min = total_sec/60; if(total_min<1) total_min=1;
+                if(trim_min<total_min)
+                    out_data = (out_data * (uint64_t)trim_min) / (uint64_t)total_min;
+            }
+        }
+    }
+
+    /* DDC decimation */
+    if(IsDlgButtonChecked(g_hwnd,ID_DDC_CHECK)){
+        wchar_t bw[16]={0}; GetWindowTextW(GetDlgItem(g_hwnd,ID_DDC_BW),bw,16);
+        int bw_khz=_wtoi(bw);
+        if(bw_khz>0&&fi->sample_rate>0){
+            int D=fi->sample_rate/(bw_khz*1000); if(D<1)D=1;
+            out_data/=(uint64_t)D;
+        }
+    }
+    return out_data;
+}
 static void update_format_controls(void)
 {
     /* Grey out format buttons that would produce a same-format no-op.
@@ -1229,7 +1289,11 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp)
             SetTextColor(di->hDC,CLR_HEADER_TEXT);
             if(g_font_title) SelectObject(di->hDC,g_font_title);
             RECT tr=di->rcItem; tr.left+=14;
-            DrawTextW(di->hDC,L"SDR Trim",-1,&tr,DT_LEFT|DT_VCENTER|DT_SINGLELINE);
+            DrawTextW(di->hDC,L"SDR Trim  v1.4",-1,&tr,DT_LEFT|DT_VCENTER|DT_SINGLELINE);
+            /* Name on right — use normal font, slightly smaller */
+            if(g_font) SelectObject(di->hDC,g_font);
+            RECT nr=di->rcItem; nr.right-=14;
+            DrawTextW(di->hDC,L"github.com/45south",-1,&nr,DT_RIGHT|DT_VCENTER|DT_SINGLELINE);
             return TRUE;
         }
         break;}
