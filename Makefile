@@ -1,63 +1,32 @@
-# Makefile for SDR Trim + SDR Trim GUI
-# Supports Linux, macOS, and Windows (MSYS2/MinGW64)
+# Makefile for SDR Trim (sdrtrim.exe)
+# Build: make clean && make
+#
+# Requires MSYS2/MinGW-w64 on Windows
 #
 # Targets:
-#   make              — build sdrtrim and sdrtrimgui (default on Windows)
-#   make sdrtrim      — build CLI tool only
-#   make sdrtrimgui   — build GUI only (Windows/MinGW only)
-#   make install      — install sdrtrim to $(PREFIX)/bin (Linux/macOS only)
-#   make clean        — remove build output
+#   make        — build sdrtrim.exe
+#   make clean  — remove build output
 
 CC     = gcc
-CFLAGS = -Wall -Wextra -O2
-LIBS   = -lm
 
-ifeq ($(OS),Windows_NT)
+# -O3 enables auto-vectorisation of the DDC inner loop (SSE2/AVX)
+# -msse2 ensures SSE2 on 32-bit builds; no-op on 64-bit
+CFLAGS = -Wall -Wextra -O3 -msse2
 
-TARGET     = sdrtrim.exe
-GUI_TARGET = sdrtrimgui.exe
-GUI_RES    = sdrtrimgui.res
-GUI_LIBS   = -lcomctl32 -lcomdlg32 -lshell32 -mwindows -municode
+LIBS   = -lcomctl32 -lcomdlg32 -lshell32 -mwindows -municode -lm
 
-.PHONY: all sdrtrim sdrtrimgui clean
+TARGET = sdrtrim.exe
+RES    = sdrtrim.res
 
-all: $(TARGET) $(GUI_TARGET)
-
-sdrtrim: $(TARGET)
-
-sdrtrimgui: $(GUI_TARGET)
-
-$(TARGET): sdrtrim.c
-	$(CC) $(CFLAGS) -o $@ sdrtrim.c $(LIBS)
-
-$(GUI_RES): sdrtrimgui.rc sdrtrimgui.manifest
-	windres sdrtrimgui.rc -O coff -o $(GUI_RES)
-
-$(GUI_TARGET): sdrtrimgui.c $(GUI_RES)
-	$(CC) $(CFLAGS) -o $@ sdrtrimgui.c $(GUI_RES) $(GUI_LIBS)
-
-clean:
-	rm -f $(TARGET) $(GUI_TARGET) $(GUI_RES)
-
-else
-
-TARGET  = sdrtrim
-PREFIX ?= /usr/local
-
-.PHONY: all sdrtrim install clean
+.PHONY: all clean
 
 all: $(TARGET)
 
-sdrtrim: $(TARGET)
+$(RES): sdrtrim.rc sdrtrim.manifest
+	windres sdrtrim.rc -O coff -o $(RES)
 
-$(TARGET): sdrtrim.c
-	$(CC) $(CFLAGS) -o $@ sdrtrim.c $(LIBS)
-
-install: $(TARGET)
-	install -d $(PREFIX)/bin
-	install -m 755 $(TARGET) $(PREFIX)/bin/$(TARGET)
+$(TARGET): sdrtrim.c $(RES)
+	$(CC) $(CFLAGS) -o $@ sdrtrim.c $(RES) $(LIBS)
 
 clean:
-	rm -f $(TARGET)
-
-endif
+	rm -f $(TARGET) $(RES)

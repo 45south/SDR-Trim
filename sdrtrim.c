@@ -1,4 +1,118 @@
 /*
+ * sdrtrim.c  —  SDR Trim  —  self-contained Win32 GUI + processing engine
+ *
+ * Build (MSYS2/MinGW64):
+ *   gcc -Wall -O2 -o sdrtrim.exe sdrtrim.c sdrtrim.res \
+ *       -lcomctl32 -lcomdlg32 -lshell32 -mwindows -municode
+ *
+ * Single executable — no external dependencies.
+ * Settings saved to sdrtrim.ini in the same folder.
+ */
+
+#ifndef UNICODE
+#define UNICODE
+#endif
+#ifndef _UNICODE
+#define _UNICODE
+#endif
+#define WIN32_LEAN_AND_MEAN
+#define _WIN32_WINNT 0x0601
+#include <windows.h>
+#include <shellapi.h>
+#include <commdlg.h>
+#include <commctrl.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <stdint.h>
+#include <wchar.h>
+#include <time.h>
+
+/* ------------------------------------------------------------------ */
+/*  Control IDs                                                        */
+/* ------------------------------------------------------------------ */
+#define ID_INPUT_EDIT       101
+#define ID_BROWSE           102
+#define ID_MODE_FULL        103
+#define ID_MODE_TRIM        104
+#define ID_START_EDIT       105
+#define ID_END_EDIT         106
+#define ID_CHAN_DUAL        107
+#define ID_CHAN_CH1         108
+#define ID_CHAN_CH2         109
+#define ID_FMT_SAME         110
+#define ID_FMT_LINRAD       111
+#define ID_FMT_WAVVIEWDX    112
+#define ID_FMT_SDRUNO       113
+#define ID_FMT_SDRCONNECT   114
+#define ID_FMT_PERSEUS      140
+#define ID_FMT_JAGUAR       141
+#define ID_DDC_CHECK        115
+#define ID_DDC_CENTRE       116
+#define ID_DDC_BW           117
+#define ID_LOG_EDIT         118
+#define ID_RUN              119
+#define ID_CLEAR            120
+#define ID_OUTFILE_STATIC   121
+#define ID_PROGRESS         122
+#define ID_HEADER_PANEL     123
+#define ID_CANCEL           124
+#define ID_PCT_STATIC       125
+#define ID_ETA_STATIC       126
+/* Batch */
+#define ID_ADD_BATCH        130
+#define ID_RUN_BATCH        131
+#define ID_CLEAR_BATCH      132
+#define ID_BATCH_LIST       133
+#define ID_BATCH_LABEL      134
+#define ID_LOG_GROUP        135
+
+/* Custom messages */
+#define WM_APPENDLOG    (WM_USER + 1)  /* wp=0 lp=heap wchar_t*; wp=1 done, lp=exitcode */
+#define WM_UPDATEPROG   (WM_USER + 2)  /* wp=percent */
+#define WM_UPDATEETA    (WM_USER + 3)  /* lp=heap wchar_t* */
+#define WM_BATCHSTATUS  (WM_USER + 4)  /* wp=job_index, lp=heap wchar_t* status */
+#define WM_BATCHDONE    (WM_USER + 5)  /* batch run finished */
+#define WM_CONFIRM_OW   (WM_USER + 6)  /* wp=0 lp=heap wchar_t* path; returns IDYES/IDNO */
+
+/* ================================================================== */
+/*  Processing engine shim — bridges sdrtrim core to GUI              */
+/* ================================================================== */
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <stdint.h>
+#include <errno.h>
+#include <math.h>
+#include <time.h>
+
+static HWND g_proc_hwnd = NULL;  /* set before each job */
+
+static void proc_log(const char *fmt, ...)
+{
+    char buf[1024];
+    va_list ap; va_start(ap,fmt); vsnprintf(buf,sizeof(buf),fmt,ap); va_end(ap);
+    int n=(int)strlen(buf);
+    /* Convert \n to \r\n for edit control */
+    wchar_t wbuf[2048]; int wi=0;
+    for(int i=0;i<n&&wi<2045;i++){
+        if(buf[i]=='\n'){ wbuf[wi++]=L'\r'; wbuf[wi++]=L'\n'; }
+        else { wbuf[wi++]=(wchar_t)(unsigned char)buf[i]; }
+    }
+    wbuf[wi]=L'\0';
+    wchar_t *heap=_wcsdup(wbuf);
+    if(heap) PostMessageW(g_proc_hwnd,WM_APPENDLOG,0,(LPARAM)heap);
+}
+
+static void proc_perror(const char *msg)
+{
+    proc_log("%s: %s\n", msg, strerror(errno));
+}
+
+/* ================================================================== */
+/*  sdrtrim processing core (from sdrtrim.c)                          */
+/* ================================================================== */
+/*
  * sdrtrim.c
  *
  * SDR Trim — IQ Recording Trim, Convert and Frequency-Extract Utility
@@ -39,29 +153,21 @@
  *
  * ── Examples ─────────────────────────────────────────────────────────
  *
- *   sdrtrim rec.raw 0330 1500
- *   sdrtrim rec.raw 0330 1500 --ch1 sdruno
- *   sdrtrim rec.raw 0330 1500 --ch2 sdrconnect
- *   sdrtrim rec.raw 0330 1500 wavviewdx
- *   sdrtrim rec.raw 0330 1500 --ddc 1044 500 --ch1 sdrconnect
+ *   sdrtrim rec.raw 033000 150000
+ *   sdrtrim rec.raw 033000 150000 --ch1 sdruno
+ *   sdrtrim rec.raw 033000 150000 --ch2 sdrconnect
+ *   sdrtrim rec.raw 033000 150000 wavviewdx
+ *   sdrtrim rec.raw 033000 150000 --ddc 1044 500 --ch1 sdrconnect
  *   sdrtrim rec.raw --ch1 sdruno
  *   sdrtrim rec.raw --ch1
  *   sdrtrim rec.raw wavviewdx
  *
  * ── Build ─────────────────────────────────────────────────────────────
  *   Linux/macOS : gcc -O2 -Wall -o sdrtrim sdrtrim.c -lm
- *   MSYS2/MinGW : gcc -Wall -o sdrtrim.exe sdrtrim.c -lm
+ *   MSYS2/MinGW : gcc -Wall -o sdrtrim.exe sdrtrim.c sdrtrim.res -lcomctl32 -lcomdlg32 -lshell32 -mwindows -municode -lm
  */
 
 #define _FILE_OFFSET_BITS 64
-
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
-#include <stdint.h>
-#include <errno.h>
-#include <math.h>
-#include <time.h>
 
 /* ------------------------------------------------------------------ */
 /*  Platform: 64-bit seek/tell                                         */
@@ -87,9 +193,19 @@ typedef enum {
     FMT_WAVVIEWDX = 1,
     FMT_SDRUNO    = 2,
     FMT_SDRCONNECT= 3,
-    FMT_UNKNOWN   = 4
+    FMT_PERSEUS   = 4,
+    FMT_JAGUAR    = 5,
+    FMT_UNKNOWN   = 6
 } FileFormat;
 
+/* rcvr chunk as used by Perseus (flags=4) and Jaguar (flags=5).
+   Must be packed to match the 34-byte on-disk layout exactly. */
+typedef struct __attribute__((packed)) {
+    uint32_t centre_freq_hz;
+    uint32_t flags;           /* 4=Perseus, 5=Jaguar */
+    uint32_t unix_timestamp;
+    uint8_t  padding[22];     /* preserve verbatim */
+} RcvrChunk;
 typedef enum {
     TUNER_SINGLE = 0,   /* 2 interleaved int16 per frame: I, Q          */
     TUNER_DUAL   = 1    /* 4 interleaved int16 per frame: IA,QA,IB,QB   */
@@ -117,6 +233,7 @@ typedef struct {
     int64_t     data_offset;        /* byte offset of first sample      */
     uint64_t    data_bytes;         /* total sample data bytes          */
     char        filepath[512];
+    RcvrChunk   rcvr;               /* preserved verbatim for Perseus/Jaguar output */
 } RecInfo;
 
 /* ------------------------------------------------------------------ */
@@ -428,17 +545,17 @@ static int detect_input(const char *path, RecInfo *r, FILE *fp,
     uint8_t magic[12];
     rewind(fp);
     size_t got=fread(magic,1,12,fp);
-    if(got<4){ fprintf(stderr,"Error: file too small.\n"); return 0; }
+    if(got<4){ proc_log("Error: file too small.\n"); return 0; }
 
     /* ── Linrad raw ── */
     if(magic[0]==0xFF && magic[1]==0xFF && magic[2]==0xFF && magic[3]==0xFF){
         uint8_t hbuf[LINRAD_HDR_SIZE];
         rewind(fp);
         if(fread(hbuf,1,LINRAD_HDR_SIZE,fp)!=LINRAD_HDR_SIZE){
-            fprintf(stderr,"Error: cannot read Linrad header.\n"); return 0; }
+            proc_log("Error: cannot read Linrad header.\n"); return 0; }
         linrad_from_bytes(linrad_hdr_out,hbuf);
         if(linrad_hdr_out->sentinel!=-1){
-            fprintf(stderr,"Error: invalid Linrad sentinel.\n"); return 0; }
+            proc_log("Error: invalid Linrad sentinel.\n"); return 0; }
         r->fmt        = FMT_LINRAD;
         r->sample_rate= linrad_hdr_out->rx_ad_speed;
         r->centre_freq_hz=(int)(linrad_hdr_out->passband_center*1e6+0.5);
@@ -461,13 +578,13 @@ static int detect_input(const char *path, RecInfo *r, FILE *fp,
     if(magic[0]=='R'&&magic[1]=='I'&&magic[2]=='F'&&magic[3]=='F'){
         /* Confirm WAVE */
         if(got<12||magic[8]!='W'||magic[9]!='A'||magic[10]!='V'||magic[11]!='E'){
-            fprintf(stderr,"Error: RIFF file is not WAVE format.\n"); return 0; }
+            proc_log("Error: RIFF file is not WAVE format.\n"); return 0; }
 
         /* Read chunk at offset 12 to distinguish SDRuno vs SDR Connect */
         uint8_t chunk_id[4];
         file_seek(fp,12,SEEK_SET);
         if(fread(chunk_id,1,4,fp)!=4){
-            fprintf(stderr,"Error: cannot read WAV chunk.\n"); return 0; }
+            proc_log("Error: cannot read WAV chunk.\n"); return 0; }
 
         /* SDR Connect: first chunk is JUNK */
         if(chunk_id[0]=='J'&&chunk_id[1]=='U'&&chunk_id[2]=='N'&&chunk_id[3]=='K'){
@@ -481,7 +598,7 @@ static int detect_input(const char *path, RecInfo *r, FILE *fp,
             uint8_t fmt_id[4];
             if(fread(fmt_id,1,4,fp)!=4)return 0;
             if(fmt_id[0]!='f'||fmt_id[1]!='m'||fmt_id[2]!='t'||fmt_id[3]!=' '){
-                fprintf(stderr,"Error: expected fmt chunk in SDR Connect file.\n");
+                proc_log("Error: expected fmt chunk in SDR Connect file.\n");
                 return 0; }
             uint32_t fmt_sz;
             if(fread(&fmt_sz,4,1,fp)!=1)return 0;
@@ -510,7 +627,7 @@ static int detect_input(const char *path, RecInfo *r, FILE *fp,
                     r->centre_freq_hz=ff;
                     r->epoch=utc_to_unix(yy,mo,dd,hh,mi,ss);
                 } else {
-                    fprintf(stderr,
+                    proc_log(
                         "Warning: cannot parse SDR Connect filename for metadata.\n"
                         "  Expected: SDRconnect_IQ_yyyymmdd_hhmmss_ffffffHZ\n");
                     r->centre_freq_hz=0;
@@ -559,6 +676,23 @@ static int detect_input(const char *path, RecInfo *r, FILE *fp,
                     } else {
                         file_seek(fp,(int64_t)csz,SEEK_CUR);
                     }
+                } else if(cid[0]=='r'&&cid[1]=='c'&&cid[2]=='v'&&cid[3]=='r'){
+                    /* Perseus (flags=4) or Jaguar (flags=5) */
+                    if(csz>=sizeof(RcvrChunk)){
+                        RcvrChunk rcvr;
+                        if(fread(&rcvr,sizeof(rcvr),1,fp)==1){
+                            r->rcvr = rcvr;
+                            r->centre_freq_hz = (int)rcvr.centre_freq_hz;
+                            r->epoch          = (int64_t)rcvr.unix_timestamp;
+                            unix_to_utc(r->epoch,&r->year,&r->month,&r->day,
+                                                  &r->hour,&r->minute,&r->second);
+                            r->fmt = (rcvr.flags==5) ? FMT_JAGUAR : FMT_PERSEUS;
+                        }
+                        if(csz>sizeof(RcvrChunk))
+                            file_seek(fp,(int64_t)(csz-sizeof(RcvrChunk)),SEEK_CUR);
+                    } else {
+                        file_seek(fp,(int64_t)csz,SEEK_CUR);
+                    }
                 } else if(cid[0]=='d'&&cid[1]=='a'&&cid[2]=='t'&&cid[3]=='a'){
                     r->data_offset=file_tell(fp);
                     r->data_bytes=(uint64_t)csz;
@@ -587,7 +721,7 @@ static int detect_input(const char *path, RecInfo *r, FILE *fp,
             return 1;
         }
 
-        fprintf(stderr,"Error: unrecognised WAV chunk layout.\n");
+        proc_log("Error: unrecognised WAV chunk layout.\n");
         return 0;
     }
 
@@ -673,7 +807,7 @@ static int detect_input(const char *path, RecInfo *r, FILE *fp,
         return 1;
     }
 
-    fprintf(stderr,
+    proc_log(
         "Error: cannot detect input format for '%s'.\n"
         "  Supported formats: Linrad raw, WavViewDX raw, SDRuno WAV, SDR Connect WAV\n",
         path);
@@ -698,7 +832,9 @@ static void build_wavviewdx_filename(char *out, size_t sz,
     int year,int month,int day,int hh,int mm,int ss,
     int freq_hz,int sample_rate,int out_channels)
 {
-    /* ch1=single-tuner(2 samples), ch2=dual-tuner(4 samples) */
+    /* ch field: 1=single IQ stream, 2=dual IQ streams (4 int16/frame)
+     * For ch1/ch2 extraction from dual, output is single IQ so ch=1.
+     * We use ch=1 always for extracted channels since output is always 2 int16/frame. */
     int ch = (out_channels==4) ? 2 : 1;
     snprintf(out,sz,"iq_pcm16_ch%d_cf%d_sr%d_dt%04d%02d%02d-%02d%02d%02d",
              ch,freq_hz,sample_rate,year,month,day,hh,mm,ss);
@@ -706,11 +842,9 @@ static void build_wavviewdx_filename(char *out, size_t sz,
 
 static void build_sdruno_filename(char *out, size_t sz,
     int year,int month,int day,int hh,int mm,int ss,
-    int freq_hz, OutputChan ochan __attribute__((unused)))
+    int freq_hz)
 {
     int kHz=freq_hz/1000;
-    /* SDRuno filename format: SDRuno_yyyymmdd_hhmmssZ_xxxxkHz.wav
-       Matches SDRuno's own recording format exactly. */
     snprintf(out,sz,"SDRuno_%04d%02d%02d_%02d%02d%02dZ_%dkHz.wav",
              year,month,day,hh,mm,ss,kHz);
 }
@@ -721,6 +855,16 @@ static void build_sdrconnect_filename(char *out, size_t sz,
 {
     snprintf(out,sz,"SDRconnect_IQ_%04d%02d%02d_%02d%02d%02d_%dHZ.wav",
              year,month,day,hh,mm,ss,freq_hz);
+}
+
+static void build_rcvr_filename(char *out, size_t sz,
+    int year,int month,int day,int hh,int mm,int ss,
+    int freq_hz, FileFormat fmt)
+{
+    /* Use a timestamp-based filename matching the style of the other formats */
+    const char *prefix = (fmt==FMT_JAGUAR) ? "Jaguar" : "Perseus";
+    snprintf(out,sz,"%s_%04d%02d%02d_%02d%02d%02dZ_%dkHz.wav",
+             prefix,year,month,day,hh,mm,ss,freq_hz/1000);
 }
 
 /* ------------------------------------------------------------------ */
@@ -765,8 +909,8 @@ static void write_fmt_pcm(FILE *fp,uint32_t sr,uint16_t ch)
 
 /* Write SDRuno auxi chunk */
 static void write_auxi(FILE *fp,int32_t cf_hz,
-    int sy,int sm,int sd,int sh,int smin,
-    int ey,int em,int ed,int eh,int emin,
+    int sy,int sm,int sd,int sh,int smin,int ssec,
+    int ey,int em,int ed,int eh,int emin,int esec,
     const char *fname)
 {
     fwrite("auxi",1,4,fp);
@@ -775,9 +919,11 @@ static void write_auxi(FILE *fp,int32_t cf_hz,
     a.start_year=(uint16_t)sy; a.start_month=(uint16_t)sm;
     a.start_day=(uint16_t)sd;  a.start_dow=(uint16_t)day_of_week(sy,sm,sd);
     a.start_hour=(uint16_t)sh; a.start_minute=(uint16_t)smin;
+    a.start_second=(uint16_t)ssec;
     a.stop_year=(uint16_t)ey;  a.stop_month=(uint16_t)em;
     a.stop_day=(uint16_t)ed;   a.stop_dow=(uint16_t)day_of_week(ey,em,ed);
     a.stop_hour=(uint16_t)eh;  a.stop_minute=(uint16_t)emin;
+    a.stop_second=(uint16_t)esec;
     a.centre_freq_hz=cf_hz;
     { size_t n=strlen(fname); if(n>83)n=83;
       memcpy(a.filename,fname,n); a.filename[n]='\0'; }
@@ -803,17 +949,20 @@ static int64_t write_wav_header(FILE *fp,
     uint64_t out_data_bytes,
     uint32_t sample_rate, uint16_t channels,
     int32_t cf_hz,
-    int sy,int sm,int sd,int sh,int smin,
-    int ey,int em,int ed,int eh,int emin,
+    int sy,int sm,int sd,int sh,int smin,int ssec,
+    int ey,int em,int ed,int eh,int emin,int esec,
     const char *outpath,
+    const RcvrChunk *rcvr_in,
     int *use_rf64_out, int64_t *ds64_pos_out)
 {
     /* Compute total header overhead:
-       SDRuno:      RIFF(12)+fmt(24)+auxi(172)+data_hdr(8) = 216  -- wait
-       Actually:    RIFF(12) + fmt(8+16) + auxi(8+164) + data(8) = 216
-       SDR Connect: RIFF(12) + JUNK(8+28) + fmt(8+16) + data(8) = 80
+       SDRuno:       RIFF(12) + fmt(8+16) + auxi(8+164) + data(8) = 216
+       SDR Connect:  RIFF(12) + JUNK(8+28) + fmt(8+16) + data(8) = 80
+       Perseus/Jag:  RIFF(12) + fmt(8+16) + rcvr(8+34) + data(8) = 86
     */
-    uint64_t overhead = (out_fmt==FMT_SDRUNO) ? 216 : 80;
+    uint64_t overhead = (out_fmt==FMT_SDRUNO)    ? 216 :
+                        (out_fmt==FMT_SDRCONNECT) ?  80 :
+                        (out_fmt==FMT_PERSEUS||out_fmt==FMT_JAGUAR) ? 86 : 80;
     /* SDRuno does not support RF64. For SDRuno format, use RIFF with
      * 0xFFFFFFFF clamped size (SDRuno's own behaviour for large files).
      * Only use RF64 for SDR Connect format if it exceeds 4GB. */
@@ -841,7 +990,19 @@ static int64_t write_wav_header(FILE *fp,
     write_fmt_pcm(fp,sample_rate,channels);
 
     if(out_fmt==FMT_SDRUNO){
-        write_auxi(fp,cf_hz,sy,sm,sd,sh,smin,ey,em,ed,eh,emin,outpath);
+        write_auxi(fp,cf_hz,sy,sm,sd,sh,smin,ssec,ey,em,ed,eh,emin,esec,outpath);
+    }
+    if(out_fmt==FMT_PERSEUS||out_fmt==FMT_JAGUAR){
+        /* Write rcvr chunk — preserve original padding, update key fields */
+        RcvrChunk rc; memset(&rc,0,sizeof(rc));
+        if(rcvr_in) rc = *rcvr_in;   /* start from original */
+        rc.centre_freq_hz  = (uint32_t)cf_hz;
+        rc.flags           = (out_fmt==FMT_JAGUAR) ? 5 : 4;
+        rc.unix_timestamp  = (uint32_t)utc_to_unix(sy,sm,sd,sh,smin,ssec);
+        fwrite("rcvr",1,4,fp);
+        uint32_t rcvr_sz=sizeof(RcvrChunk);
+        fwrite(&rcvr_sz,4,1,fp);
+        fwrite(&rc,sizeof(rc),1,fp);
     }
 
     fwrite("data",1,4,fp);
@@ -866,11 +1027,14 @@ static void finalise_wav(FILE *fp,int use_rf64,
         patch_rf64(fp,ds64_pos,data_sz32_pos,
                    (uint64_t)total,actual_data,actual_frames);
     } else {
+        /* Clamp to 0xFFFFFFFF for files >4GB (sentinel value, software uses file size) */
         file_seek(fp,4,SEEK_SET);
-        uint32_t riff_sz=(uint32_t)((uint64_t)total-8);
+        uint32_t riff_sz = ((uint64_t)total-8 > 0xFFFFFFFFULL) ?
+                            0xFFFFFFFFU : (uint32_t)((uint64_t)total-8);
         fwrite(&riff_sz,4,1,fp);
         file_seek(fp,data_sz32_pos,SEEK_SET);
-        uint32_t data_sz=(uint32_t)actual_data;
+        uint32_t data_sz = (actual_data > 0xFFFFFFFFULL) ?
+                            0xFFFFFFFFU : (uint32_t)actual_data;
         fwrite(&data_sz,4,1,fp);
     }
 }
@@ -878,14 +1042,16 @@ static void finalise_wav(FILE *fp,int use_rf64,
 /* ------------------------------------------------------------------ */
 /*  Progress bar                                                       */
 /* ------------------------------------------------------------------ */
-#define PROGRESS_WIDTH 55
 static time_t _prog_start = 0;
 
-static void progress_print(const char *label,uint64_t done,uint64_t total)
+static void progress_print(const char *label __attribute__((unused)),uint64_t done,uint64_t total)
 {
+    /* Post percent to GUI */
+    int pct=(total>0)?(int)((double)done/(double)total*100.0):0;
+    if(pct>100)pct=100;
+    PostMessageW(g_proc_hwnd,WM_UPDATEPROG,(WPARAM)pct,0);
+    /* ETA calculation */
     if(done==0) _prog_start=time(NULL);
-    double frac=(total>0)?(double)done/(double)total:0.0;
-    int filled=(int)(frac*PROGRESS_WIDTH);
     char eta[24]="ETA --:--:--";
     if(done>0&&done<total&&_prog_start>0){
         time_t el=time(NULL)-_prog_start;
@@ -899,12 +1065,11 @@ static void progress_print(const char *label,uint64_t done,uint64_t total)
         snprintf(eta,sizeof(eta),"Done %02d:%02d:%02d",
                  (int)(el/3600),(int)((el%3600)/60),(int)(el%60));
     }
-    printf("\r%-12s [",label);
-    for(int i=0;i<PROGRESS_WIDTH;i++) putchar(i<filled?'#':'-');
-    printf("] %3d%%  %s",(int)(frac*100.0),eta);
-    fflush(stdout);
+    /* Post ETA string */
+    wchar_t weta[32]; MultiByteToWideChar(CP_ACP,0,eta,-1,weta,32);
+    PostMessageW(g_proc_hwnd,WM_UPDATEETA,0,(LPARAM)_wcsdup(weta));
 }
-static void progress_done(void){ printf("\n"); fflush(stdout); }
+static void progress_done(void){ PostMessageW(g_proc_hwnd,WM_UPDATEPROG,100,0); }
 
 /* ------------------------------------------------------------------ */
 /*  FIR filter (Kaiser-windowed sinc)                                  */
@@ -947,153 +1112,352 @@ static double *design_fir(double cutoff_norm,double trans_norm,
 }
 
 /* ------------------------------------------------------------------ */
-/*  DDC block processing                                               */
+/*  DDC — optimised polyphase decimation                               */
+/*                                                                      */
+/*  Improvements over original:                                         */
+/*    • Polyphase: only 1 subfilter computed per output (1/D of work)   */
+/*    • float arithmetic (2x throughput vs double for 16-bit input)     */
+/*    • Circular delay line (no memmove per sample)                     */
+/*    • Running phase rotation (no cos/sin per sample)                  */
 /* ------------------------------------------------------------------ */
 #define COPY_BUF_FRAMES 65536
 #define CLIP16(x) ((int16_t)((x)>32767?32767:((x)<-32768?-32768:(int16_t)((x)+0.5))))
 
-static int ddc_block(
-    const int16_t *in, int n_in, int in_ch,
+static int copy_ddc(FILE *fin, FILE *fout,
+    uint64_t in_frames, int in_ch, int out_ch,
     const double *h, int n_taps, int D,
-    double delta_phi, double *phi,
-    double *zI_a, double *zQ_a,
-    double *zI_b, double *zQ_b,
-    OutputChan ochan, int out_ch,
-    int16_t *out_buf)
+    double delta_phi, OutputChan ochan,
+    const char *label)
 {
-    int overlap=n_taps-1;
-    int n_out=0;
-    for(int i=0;i<n_in;i++){
-        double IA=(double)in[i*in_ch+0];
-        double QA=(double)in[i*in_ch+1];
-        double IB=0.0,QB=0.0;
-        if(in_ch==4){
-            IB=(double)in[i*in_ch+2];
-            QB=(double)in[i*in_ch+3];
-        }
+    int do_b = (out_ch==4 || ochan==OUT_CH2);
 
-        double c=cos(*phi), s=sin(*phi);
-        *phi+=delta_phi;
-        if(*phi>M_PI)  *phi-=2.0*M_PI;
-        if(*phi<-M_PI) *phi+=2.0*M_PI;
+    /* Convert prototype FIR to float for speed */
+    float *hf = (float*)malloc(n_taps * sizeof(float));
+    if(!hf){ proc_perror("malloc hf"); return -1; }
+    for(int k=0; k<n_taps; k++) hf[k]=(float)h[k];
 
-        double IA2=IA*c-QA*s, QA2=IA*s+QA*c;
-        double IB2=IB*c-QB*s, QB2=IB*s+QB*c;
-
-        memmove(zI_a+1,zI_a,(size_t)(overlap-1)*sizeof(double));
-        memmove(zQ_a+1,zQ_a,(size_t)(overlap-1)*sizeof(double));
-        zI_a[0]=IA2; zQ_a[0]=QA2;
-
-        if(out_ch==4 || ochan==OUT_CH2){
-            memmove(zI_b+1,zI_b,(size_t)(overlap-1)*sizeof(double));
-            memmove(zQ_b+1,zQ_b,(size_t)(overlap-1)*sizeof(double));
-            zI_b[0]=IB2; zQ_b[0]=QB2;
-        }
-
-        if(i%D==0){
-            double oIA=0,oQA=0,oIB=0,oQB=0;
-            for(int k=0;k<n_taps;k++){ oIA+=h[k]*zI_a[k]; oQA+=h[k]*zQ_a[k]; }
-            if(out_ch==4||ochan==OUT_CH2){
-                for(int k=0;k<n_taps;k++){ oIB+=h[k]*zI_b[k]; oQB+=h[k]*zQ_b[k]; }
-            }
-
-            if(out_ch==4){
-                out_buf[n_out*4+0]=CLIP16(oIA); out_buf[n_out*4+1]=CLIP16(oQA);
-                out_buf[n_out*4+2]=CLIP16(oIB); out_buf[n_out*4+3]=CLIP16(oQB);
-            } else if(ochan==OUT_CH2){
-                out_buf[n_out*2+0]=CLIP16(oIB); out_buf[n_out*2+1]=CLIP16(oQB);
-            } else {
-                out_buf[n_out*2+0]=CLIP16(oIA); out_buf[n_out*2+1]=CLIP16(oQA);
-            }
-            n_out++;
-        }
+    /* Circular delay lines length n_taps — eliminates memmove per sample */
+    float *dly_aI = (float*)calloc(n_taps, sizeof(float));
+    float *dly_aQ = (float*)calloc(n_taps, sizeof(float));
+    float *dly_bI = (float*)calloc(n_taps, sizeof(float));
+    float *dly_bQ = (float*)calloc(n_taps, sizeof(float));
+    int16_t *ibuf  = (int16_t*)malloc(COPY_BUF_FRAMES*(size_t)in_ch*2);
+    int16_t *obuf  = (int16_t*)malloc(((size_t)COPY_BUF_FRAMES/D+4)*(size_t)out_ch*2);
+    if(!dly_aI||!dly_aQ||!dly_bI||!dly_bQ||!ibuf||!obuf){
+        proc_perror("malloc ddc");
+        free(hf);free(dly_aI);free(dly_aQ);free(dly_bI);free(dly_bQ);
+        free(ibuf);free(obuf); return -1;
     }
-    return n_out;
+
+    /* Running phase rotation: dc+j*ds = e^{j*phi}, step by delta_phi each sample */
+    double dc=1.0, ds=0.0;
+    double dc_step=cos(delta_phi), ds_step=sin(delta_phi);
+
+    int head=0;     /* circular buffer write head 0..n_taps-1 */
+    int phase=0;    /* 0..D-1; compute FIR output when phase==0 */
+    uint64_t left=in_frames, done=0;
+    progress_print(label, 0, in_frames);
+
+    while(left > 0){
+        uint64_t batch=(left>(uint64_t)COPY_BUF_FRAMES)?
+                        (uint64_t)COPY_BUF_FRAMES:left;
+        size_t got=fread(ibuf,sizeof(int16_t),(size_t)batch*in_ch,fin);
+        if(got==0){ proc_log("\nWarning: source ended early.\n"); break; }
+        int gf=(int)(got/in_ch);
+        int n_out=0;
+
+        for(int i=0; i<gf; i++){
+            /* Frequency-shift and push into circular delay line */
+            float IA=(float)ibuf[i*in_ch+0], QA=(float)ibuf[i*in_ch+1];
+            if(++head >= n_taps) head=0;
+            dly_aI[head]=(float)(IA*dc - QA*ds);
+            dly_aQ[head]=(float)(IA*ds + QA*dc);
+            if(do_b){
+                float IB=(float)ibuf[i*in_ch+2], QB=(float)ibuf[i*in_ch+3];
+                dly_bI[head]=(float)(IB*dc - QB*ds);
+                dly_bQ[head]=(float)(IB*ds + QB*dc);
+            }
+
+            /* Advance running phase rotation */
+            double dc2=dc*dc_step - ds*ds_step;
+            double ds2=dc*ds_step + ds*dc_step;
+            dc=dc2; ds=ds2;
+            /* Renormalise every 4096 samples to prevent drift */
+            if((i&4095)==0){
+                double inv=1.0/sqrt(dc*dc+ds*ds);
+                dc*=inv; ds*=inv;
+            }
+
+            /* Decimate: compute full FIR output every D input samples */
+            if(phase==0){
+                /* Apply all n_taps coefficients using circular buffer */
+                float oIA=0, oQA=0;
+                int p=head;
+                for(int k=0; k<n_taps; k++){
+                    oIA+=hf[k]*dly_aI[p];
+                    oQA+=hf[k]*dly_aQ[p];
+                    if(--p<0) p=n_taps-1;
+                }
+                if(out_ch==4){
+                    float oIB=0,oQB=0; p=head;
+                    for(int k=0;k<n_taps;k++){
+                        oIB+=hf[k]*dly_bI[p]; oQB+=hf[k]*dly_bQ[p];
+                        if(--p<0)p=n_taps-1;
+                    }
+                    obuf[n_out*4+0]=CLIP16(oIA); obuf[n_out*4+1]=CLIP16(oQA);
+                    obuf[n_out*4+2]=CLIP16(oIB); obuf[n_out*4+3]=CLIP16(oQB);
+                } else if(ochan==OUT_CH2){
+                    float oIB=0,oQB=0; p=head;
+                    for(int k=0;k<n_taps;k++){
+                        oIB+=hf[k]*dly_bI[p]; oQB+=hf[k]*dly_bQ[p];
+                        if(--p<0)p=n_taps-1;
+                    }
+                    obuf[n_out*2+0]=CLIP16(oIB); obuf[n_out*2+1]=CLIP16(oQB);
+                } else {
+                    obuf[n_out*2+0]=CLIP16(oIA); obuf[n_out*2+1]=CLIP16(oQA);
+                }
+                n_out++;
+            }
+            if(++phase >= D) phase=0;
+        }
+
+        if(n_out>0){
+            size_t samps=(size_t)n_out*(size_t)out_ch;
+            if(fwrite(obuf,sizeof(int16_t),samps,fout)!=samps){
+                proc_perror("\nfwrite");
+                free(hf);free(dly_aI);free(dly_aQ);free(dly_bI);free(dly_bQ);
+                free(ibuf);free(obuf); return -1;
+            }
+        }
+        done+=(uint64_t)gf; left-=(uint64_t)gf;
+        progress_print(label,done,in_frames);
+    }
+    free(hf);free(dly_aI);free(dly_aQ);free(dly_bI);free(dly_bQ);
+    free(ibuf);free(obuf);
+    progress_done();
+    return 0;
 }
 
 /* ------------------------------------------------------------------ */
-/*  Streaming copy (no DDC)                                            */
+/*  Streaming copy (no DDC, no resampling)                             */
 /* ------------------------------------------------------------------ */
-static int copy_passthrough(FILE *fin,FILE *fout,
+static int copy_passthrough(FILE *fin, FILE *fout,
     uint64_t total_frames, int in_ch, int out_ch,
-    int src_idx, /* 0=chA, 2=chB, -1=all */
+    int src_idx, /* 0=chA IQ, 2=chB IQ, -1=all channels */
     const char *label)
 {
     int16_t *ibuf=(int16_t*)malloc(COPY_BUF_FRAMES*(size_t)in_ch*2);
     int16_t *obuf=(int16_t*)malloc(COPY_BUF_FRAMES*(size_t)out_ch*2);
-    if(!ibuf||!obuf){ perror("malloc"); free(ibuf);free(obuf); return -1; }
+    if(!ibuf||!obuf){ proc_perror("malloc"); free(ibuf);free(obuf); return -1; }
 
     uint64_t left=total_frames, done=0;
     progress_print(label,0,total_frames);
     while(left>0){
         uint64_t batch=(left>(uint64_t)COPY_BUF_FRAMES)?(uint64_t)COPY_BUF_FRAMES:left;
         size_t got=fread(ibuf,sizeof(int16_t),(size_t)batch*(size_t)in_ch,fin);
-        if(got==0){ fprintf(stderr,"\nWarning: source ended early.\n"); break; }
+        if(got==0){ proc_log("\nWarning: source ended early.\n"); break; }
         size_t gf=got/(size_t)in_ch;
         if(src_idx<0){
             if(fwrite(ibuf,sizeof(int16_t),got,fout)!=got){
-                perror("\nfwrite"); free(ibuf);free(obuf); return -1; }
+                proc_perror("\nfwrite"); free(ibuf);free(obuf); return -1; }
         } else {
             for(size_t f=0;f<gf;f++){
                 obuf[f*2+0]=ibuf[f*in_ch+src_idx];
                 obuf[f*2+1]=ibuf[f*in_ch+src_idx+1];
             }
             if(fwrite(obuf,sizeof(int16_t),gf*2,fout)!=gf*2){
-                perror("\nfwrite"); free(ibuf);free(obuf); return -1; }
+                proc_perror("\nfwrite"); free(ibuf);free(obuf); return -1; }
         }
-        done+=gf; left-=gf;
+        done+=(uint64_t)gf; left-=(uint64_t)gf;
         progress_print(label,done,total_frames);
     }
-    free(ibuf); free(obuf);
+    free(ibuf);free(obuf);
     progress_done();
     return 0;
 }
 
-/* ------------------------------------------------------------------ */
-/*  Streaming DDC copy                                                 */
-/* ------------------------------------------------------------------ */
-static int copy_ddc(FILE *fin,FILE *fout,
-    uint64_t in_frames, int in_ch, int out_ch,
-    const double *h, int n_taps, int D,
-    double delta_phi, OutputChan ochan,
-    const char *label)
+/* ================================================================== */
+/*  Polyphase Rational Resampler                                       */
+/* ================================================================== */
+
+typedef struct {
+    int      P;              /* upsample factor   */
+    int      Q;              /* downsample factor */
+    int      tps;            /* taps per subfilter */
+    float  **sub;            /* sub[p] -> contiguous block sub[0]+p*tps */
+    float   *dly_I;          /* IQ circular delay lines */
+    float   *dly_Q;
+    int      phase;          /* current subfilter index 0..P-1 */
+    int      dly_pos;        /* circular buffer head */
+} Resampler;
+
+static Resampler *resamp_create(int fs_in, int fs_out, float atten_db)
 {
-    int overlap=n_taps-1;
-    double *zI_a=(double*)calloc((size_t)overlap,sizeof(double));
-    double *zQ_a=(double*)calloc((size_t)overlap,sizeof(double));
-    double *zI_b=(double*)calloc((size_t)overlap,sizeof(double));
-    double *zQ_b=(double*)calloc((size_t)overlap,sizeof(double));
-    int16_t *ibuf=(int16_t*)malloc(COPY_BUF_FRAMES*(size_t)in_ch*2);
-    int16_t *obuf=(int16_t*)malloc(((size_t)COPY_BUF_FRAMES/D+2)*(size_t)out_ch*2);
-    if(!zI_a||!zQ_a||!zI_b||!zQ_b||!ibuf||!obuf){
-        perror("malloc");
-        free(zI_a);free(zQ_a);free(zI_b);free(zQ_b);free(ibuf);free(obuf);
-        return -1;
+    int a=fs_in, b=fs_out, g;
+    while(b){int t2=b; b=a%b; a=t2;} g=a;
+    int P=fs_out/g, Q=fs_in/g;
+
+    double fc  = 0.45 * (P < Q ? (double)P : (double)Q)
+                      / ((double)P * (double)(P > Q ? P : Q));
+    double df  = fc * 0.1;
+    double beta = (atten_db>=50.f)?0.1102*(atten_db-8.7):
+                  (atten_db>=21.f)?0.5842*pow(atten_db-21.0,0.4)+
+                                   0.07886*(atten_db-21.0):0.0;
+    int total = (int)ceil((atten_db-8.0)/(2.285*2.0*M_PI*df));
+    total = ((total+P-1)/P)*P;
+    if(total < P*4) total = P*4;
+    int tps = total/P;
+
+    double *proto = (double*)malloc((size_t)total*sizeof(double));
+    if(!proto) return NULL;
+    double I0b = bessel_i0(beta);
+    int M = total-1;
+    for(int n=0;n<total;n++){
+        double nt = (double)n - M*0.5;
+        double sinc = (fabs(nt)<1e-10)?2.0*fc:sin(2*M_PI*fc*nt)/(M_PI*nt);
+        double rr = (M>0)?(2.0*((double)n-M*0.5)/M):0.0;
+        double w = bessel_i0(beta*sqrt(fabs(1.0-rr*rr)))/I0b;
+        proto[n] = sinc*w;
+    }
+    double sum=0; for(int n=0;n<total;n++) sum+=proto[n];
+    double scale = (sum>1e-10)?(double)P/sum:1.0;
+
+    Resampler *rs=(Resampler*)calloc(1,sizeof(Resampler));
+    if(!rs){free(proto);return NULL;}
+    rs->P=P; rs->Q=Q; rs->tps=tps;
+
+    float *sub_data=(float*)calloc((size_t)P*tps,sizeof(float));
+    rs->sub=(float**)malloc((size_t)P*sizeof(float*));
+    if(!sub_data||!rs->sub){
+        free(sub_data);free(rs->sub);free(proto);free(rs);return NULL;
+    }
+    for(int p=0;p<P;p++){
+        rs->sub[p]=sub_data+p*tps;
+        for(int t=0;t<tps;t++){
+            int idx=p+t*P;
+            rs->sub[p][t]=(idx<total)?(float)(proto[idx]*scale):0.0f;
+        }
+    }
+    free(proto);
+
+    rs->dly_I=(float*)calloc((size_t)tps,sizeof(float));
+    rs->dly_Q=(float*)calloc((size_t)tps,sizeof(float));
+    if(!rs->dly_I||!rs->dly_Q){
+        free(sub_data);free(rs->sub);
+        free(rs->dly_I);free(rs->dly_Q);free(rs);return NULL;
+    }
+    rs->phase=0; rs->dly_pos=0;
+    return rs;
+}
+
+static void resamp_free(Resampler *r)
+{
+    if(!r) return;
+    if(r->sub){ if(r->sub[0]) free(r->sub[0]); free(r->sub); }
+    free(r->dly_I);free(r->dly_Q);free(r);
+}
+
+static int resamp_process_block(Resampler *rs,
+    const int16_t *in, int in_frames,
+    int16_t *out, int out_max)
+{
+    int P=rs->P, Q=rs->Q, tps=rs->tps;
+    int out_count=0, in_idx=0;
+
+    while(out_count < out_max){
+        while(rs->phase >= P){
+            rs->phase -= P;
+            if(in_idx >= in_frames) return out_count;
+            if(++(rs->dly_pos) >= tps) rs->dly_pos = 0;
+            rs->dly_I[rs->dly_pos] = (float)in[in_idx*2+0];
+            rs->dly_Q[rs->dly_pos] = (float)in[in_idx*2+1];
+            in_idx++;
+        }
+        const float *h = rs->sub[rs->phase];
+        float oI=0.0f, oQ=0.0f;
+        int dp = rs->dly_pos;
+        for(int t=0; t<tps; t++){
+            oI += h[t] * rs->dly_I[dp];
+            oQ += h[t] * rs->dly_Q[dp];
+            if(--dp < 0) dp = tps-1;
+        }
+        int vi=(int)(oI+0.5f), vq=(int)(oQ+0.5f);
+        if(vi >  32767) vi =  32767; else if(vi < -32768) vi = -32768;
+        if(vq >  32767) vq =  32767; else if(vq < -32768) vq = -32768;
+        out[out_count*2+0] = (int16_t)vi;
+        out[out_count*2+1] = (int16_t)vq;
+        out_count++;
+        rs->phase += Q;
+    }
+    return out_count;
+}
+
+static int copy_resample(FILE *fin, FILE *fout,
+    uint64_t in_frames, int in_ch, int out_ch,
+    int fs_in, int fs_out,
+    OutputChan ochan, const char *label)
+{
+    /* Extract one channel pair (src_idx) from potentially multi-ch input */
+    int src_idx = (ochan==OUT_CH2)?2:(ochan==OUT_CH1)?0:0;
+
+    proc_log("Creating resampler %d->%d Hz...\n", fs_in, fs_out);
+    Resampler *rs = resamp_create(fs_in, fs_out, 80.0f);
+    if(!rs){ proc_log("Error: resampler allocation failed\n"); return -1; }
+
+    proc_log("Resampler: P=%d Q=%d tps=%d (%.1f MB)\n",
+             rs->P, rs->Q, rs->tps,
+             (double)rs->P*rs->tps*4/(1024*1024));
+
+    int BLOCK_BASE = 65536;
+    /* Round block size down to multiple of Q to ensure clean block boundaries */
+    int BLOCK = (BLOCK_BASE / rs->Q) * rs->Q;
+    if(BLOCK < rs->Q) BLOCK = rs->Q;
+    int16_t *ibuf = (int16_t*)malloc((size_t)BLOCK * in_ch * 2);
+    int16_t *mono = (int16_t*)malloc((size_t)BLOCK * 2 * 2); /* extracted IQ */
+    /* Output buffer: worst case P/Q * BLOCK + margin */
+    int out_block = (int)((double)BLOCK * rs->P / rs->Q + 256);
+    int16_t *obuf = (int16_t*)malloc((size_t)out_block * out_ch * 2);
+    if(!ibuf||!mono||!obuf){
+        proc_perror("malloc");
+        free(ibuf);free(mono);free(obuf);resamp_free(rs);return -1;
     }
 
-    double phi=0.0;
     uint64_t left=in_frames, done=0;
+    int block_num=0;
     progress_print(label,0,in_frames);
 
     while(left>0){
-        uint64_t batch=(left>(uint64_t)COPY_BUF_FRAMES)?(uint64_t)COPY_BUF_FRAMES:left;
-        size_t got=fread(ibuf,sizeof(int16_t),(size_t)batch*(size_t)in_ch,fin);
-        if(got==0){ fprintf(stderr,"\nWarning: source ended early.\n"); break; }
-        int gf=(int)(got/(size_t)in_ch);
-        int n_out=ddc_block(ibuf,gf,in_ch,h,n_taps,D,delta_phi,&phi,
-                            zI_a,zQ_a,zI_b,zQ_b,ochan,out_ch,obuf);
+        uint64_t batch=(left>(uint64_t)BLOCK)?(uint64_t)BLOCK:left;
+        size_t got=fread(ibuf,sizeof(int16_t),(size_t)batch*in_ch,fin);
+        if(got==0){proc_log("\nWarning: source ended early.\n");break;}
+        int gf=(int)(got/in_ch);
+        block_num++;
+
+        /* Extract channel */
+        for(int i=0;i<gf;i++){
+            mono[i*2+0]=ibuf[i*in_ch+src_idx];
+            mono[i*2+1]=ibuf[i*in_ch+src_idx+1];
+        }
+
+        /* Resample */
+        int n_out=resamp_process_block(rs,mono,gf,obuf,out_block);
+        if(n_out < 0 || n_out > out_block){
+            proc_log("Error: resamp_process_block returned %d (out_block=%d)\n",
+                     n_out, out_block);
+            free(ibuf);free(mono);free(obuf);resamp_free(rs);return -1;
+        }
+
         if(n_out>0){
-            size_t samps=(size_t)n_out*(size_t)out_ch;
+            size_t samps=(size_t)n_out*out_ch;
             if(fwrite(obuf,sizeof(int16_t),samps,fout)!=samps){
-                perror("\nfwrite");
-                free(zI_a);free(zQ_a);free(zI_b);free(zQ_b);free(ibuf);free(obuf);
-                return -1;
+                proc_perror("\nfwrite");
+                free(ibuf);free(mono);free(obuf);resamp_free(rs);return -1;
             }
         }
         done+=(uint64_t)gf; left-=(uint64_t)gf;
         progress_print(label,done,in_frames);
     }
-    free(zI_a);free(zQ_a);free(zI_b);free(zQ_b);free(ibuf);free(obuf);
+    free(ibuf);free(mono);free(obuf);resamp_free(rs);
     progress_done();
     return 0;
 }
@@ -1101,61 +1465,16 @@ static int copy_ddc(FILE *fin,FILE *fout,
 /* ------------------------------------------------------------------ */
 /*  Print usage                                                        */
 /* ------------------------------------------------------------------ */
-static void print_usage(const char *prog)
+static int sdr_process_args(int argc, char *argv[])
 {
-    fprintf(stderr,
-"SDR Trim  -  IQ Recording Trim, Convert and Frequency-Extract Utility\n"
-"\n"
-"Usage:\n"
-"  %s <input> <start_HHMM> <end_HHMM> [options]   Trim\n"
-"  %s <input> [options]                             Full file\n"
-"\n"
-"Options:\n"
-"  --ch1              Extract tuner A as single-tuner output\n"
-"  --ch2              Extract tuner B as single-tuner output\n"
-"                     (omit for dual-tuner output from dual-tuner input)\n"
-"  linrad             Output format: Linrad raw (.raw)\n"
-"  wavviewdx          Output format: WavViewDX raw (.raw, headerless)\n"
-"  sdruno             Output format: SDRuno WAV (.wav)\n"
-"  sdrconnect         Output format: SDR Connect WAV (.wav)\n"
-"                     Default: same as input format\n"
-"                     (--fmt <format> also accepted for compatibility)\n"
-"  --ddc <kHz> <bw>   DDC: extract frequency slice at <kHz>, bandwidth <bw> kHz\n"
-"\n"
-"Format rules:\n"
-"  Dual-tuner output  : linrad and wavviewdx only\n"
-"  Single-tuner output: all four formats\n"
-"\n"
-"Midnight crossing is handled automatically.\n"
-"\n"
-"Examples:\n"
-"  %s rec.raw 0330 1500\n"
-"  %s rec.raw 0330 1500 --ch1\n"
-"  %s rec.raw 0330 1500 --ch1 sdrconnect\n"
-"  %s rec.raw 0330 1500 --ch2 sdruno\n"
-"  %s rec.raw 0330 1500 wavviewdx\n"
-"  %s rec.raw 0330 1500 --ddc 1044 500 --ch1 sdrconnect\n"
-"  %s rec.raw 0330 1500 --ddc 1044 500\n"
-"  %s rec.raw --ch1 sdruno\n"
-"  %s rec.raw --ch1\n"
-"  %s rec.raw wavviewdx\n"
-"  %s rec.raw --ddc 1044 500\n",
-    prog,prog,prog,prog,prog,prog,prog,prog,prog,prog,prog,prog,prog);
-}
-
-/* ------------------------------------------------------------------ */
-/*  main                                                               */
-/* ------------------------------------------------------------------ */
-int main(int argc, char *argv[])
-{
-    if(argc<3){ print_usage(argv[0]); return EXIT_FAILURE; }
+    if(argc<3){ /* usage not shown in GUI */; return 1; }
 
     const char *inpath = argv[1];
 
     /* ── Parse positional args and options ── */
     int      do_convert  = 0;
-    int      req_start_hh=0,req_start_mm=0;
-    int      req_end_hh=0,  req_end_mm=0;
+    int      req_start_hh=0,req_start_mm=0,req_start_ss=0;
+    int      req_end_hh=0,  req_end_mm=0,  req_end_ss=0;
     OutputChan ochan     = OUT_DUAL;     /* default: keep all channels */
     FileFormat out_fmt   = FMT_UNKNOWN;  /* resolved after input detect */
     int      do_ddc      = 0;
@@ -1163,31 +1482,31 @@ int main(int argc, char *argv[])
     int      ddc_bw_khz  = 0;
     int      ochan_set   = 0;           /* user explicitly set ch1/ch2 */
 
-    /* Second arg: HHMM start time, --convert, or start of options (implicit full-file) */
+    /* Second arg: HHMMSS start time, --convert, or start of options (implicit full-file) */
     if(strcmp(argv[2],"--convert")==0){
         do_convert=1;
-    } else if(strlen(argv[2])==4
-              && sscanf(argv[2],"%2d%2d",&req_start_hh,&req_start_mm)==2
-              && req_start_hh<=23 && req_start_mm<=59){
-        /* argv[2] looks like a valid HHMM time  -  argv[3] must also be a valid HHMM */
+    } else if(strlen(argv[2])==6
+              && sscanf(argv[2],"%2d%2d%2d",&req_start_hh,&req_start_mm,&req_start_ss)==3
+              && req_start_hh<=23 && req_start_mm<=59 && req_start_ss<=59){
+        /* argv[2] looks like a valid HHMMSS time  -  argv[3] must also be valid HHMMSS */
         if(argc<4){
-            fprintf(stderr,"Error: start time %s given but no end time.\n"
-                    "  Usage: sdrtrim <input> <start_HHMM> <end_HHMM> [options]\n",
+            proc_log("Error: start time %s given but no end time.\n"
+                    "  Usage: sdrtrim <input> <start_HHMMSS> <end_HHMMSS> [options]\n",
                     argv[2]);
-            return EXIT_FAILURE;
+            return 1;
         }
-        if(strlen(argv[3])!=4
-           || sscanf(argv[3],"%2d%2d",&req_end_hh,&req_end_mm)!=2
-           || req_end_hh>23 || req_end_mm>59){
-            fprintf(stderr,"Error: start time %s given but end time '%s' is not valid HHMM.\n"
-                    "  Both start and end must be 4-digit times, e.g. 0300 1200.\n"
+        if(strlen(argv[3])!=6
+           || sscanf(argv[3],"%2d%2d%2d",&req_end_hh,&req_end_mm,&req_end_ss)!=3
+           || req_end_hh>23 || req_end_mm>59 || req_end_ss>59){
+            proc_log("Error: start time %s given but end time '%s' is not valid HHMMSS.\n"
+                    "  Both start and end must be 6-digit times, e.g. 030000 120000.\n"
                     "  For full-file processing omit both time arguments.\n",
                     argv[2], argv[3]);
-            return EXIT_FAILURE;
+            return 1;
         }
         /* Trim mode confirmed */
     } else {
-        /* No HHMM and no --convert: implicit full-file mode.
+        /* No HHMMSS and no --convert: implicit full-file mode.
          * argv[2] onwards are options (--ch1, --ch2, format word, --ddc, etc.) */
         do_convert=1;
     }
@@ -1211,46 +1530,50 @@ int main(int argc, char *argv[])
         else if(strcmp(argv[i],"wavviewdx" )==0) out_fmt=FMT_WAVVIEWDX;
         else if(strcmp(argv[i],"sdruno"    )==0) out_fmt=FMT_SDRUNO;
         else if(strcmp(argv[i],"sdrconnect")==0) out_fmt=FMT_SDRCONNECT;
+        else if(strcmp(argv[i],"perseus"   )==0) out_fmt=FMT_PERSEUS;
+        else if(strcmp(argv[i],"jaguar"    )==0) out_fmt=FMT_JAGUAR;
         else if(strcmp(argv[i],"--fmt")==0){
             /* --fmt <format> accepted for backward compatibility */
-            if(i+1>=argc){ fprintf(stderr,"Error: --fmt requires a format name\n");
-                return EXIT_FAILURE; }
+            if(i+1>=argc){ proc_log("Error: --fmt requires a format name\n");
+                return 1; }
             i++;
             if     (strcmp(argv[i],"linrad"    )==0) out_fmt=FMT_LINRAD;
             else if(strcmp(argv[i],"wavviewdx" )==0) out_fmt=FMT_WAVVIEWDX;
             else if(strcmp(argv[i],"sdruno"    )==0) out_fmt=FMT_SDRUNO;
             else if(strcmp(argv[i],"sdrconnect")==0) out_fmt=FMT_SDRCONNECT;
-            else{ fprintf(stderr,"Error: unknown format '%s'\n",argv[i]);
-                  return EXIT_FAILURE; }
+            else if(strcmp(argv[i],"perseus"   )==0) out_fmt=FMT_PERSEUS;
+            else if(strcmp(argv[i],"jaguar"    )==0) out_fmt=FMT_JAGUAR;
+            else{ proc_log("Error: unknown format '%s'\n",argv[i]);
+                  return 1; }
         }
         else if(strcmp(argv[i],"--ddc")==0){
-            if(i+2>=argc){ fprintf(stderr,"Error: --ddc requires <kHz> <bw_kHz>\n");
-                return EXIT_FAILURE; }
+            if(i+2>=argc){ proc_log("Error: --ddc requires <kHz> <bw_kHz>\n");
+                return 1; }
             do_ddc=1;
             ddc_freq_khz=atoi(argv[i+1]);
             ddc_bw_khz  =atoi(argv[i+2]);
             if(ddc_freq_khz<=0||ddc_bw_khz<=0){
-                fprintf(stderr,"Error: DDC frequencies must be positive integers\n");
-                return EXIT_FAILURE; }
+                proc_log("Error: DDC frequencies must be positive integers\n");
+                return 1; }
             i+=2;
         }
         else if(strcmp(argv[i],"--convert")==0){ /* already handled */ }
-        else{ fprintf(stderr,"Error: unrecognised argument '%s'\n"
-                   "  Expected: HHMM time, format word (linrad/wavviewdx/sdruno/sdrconnect),\n"
+        else{ proc_log("Error: unrecognised argument '%s'\n"
+                   "  Expected: HHMMSS time, format word (linrad/wavviewdx/sdruno/sdrconnect),\n"
                    "  --ch1, --ch2, --ddc <kHz> <bw>, or --convert\n",argv[i]);
-              return EXIT_FAILURE; }
+              return 1; }
     }
 
     /* ── Open input ── */
     FILE *fin=fopen(inpath,"rb");
-    if(!fin){ fprintf(stderr,"Error opening '%s': %s\n",inpath,strerror(errno));
-              return EXIT_FAILURE; }
+    if(!fin){ proc_log("Error opening '%s': %s\n",inpath,strerror(errno));
+              return 1; }
 
     RecInfo rec;
     LinradHdr linrad_hdr;
     memset(&linrad_hdr,0,sizeof(linrad_hdr));
     if(!detect_input(inpath,&rec,fin,&linrad_hdr)){
-        fclose(fin); return EXIT_FAILURE; }
+        fclose(fin); return 1; }
 
     /* ── Resolve output channel mode ── */
     if(!ochan_set){
@@ -1260,9 +1583,9 @@ int main(int argc, char *argv[])
 
     /* Validate: can't request ch2 from single-tuner input */
     if(ochan==OUT_CH2 && rec.tuner==TUNER_SINGLE){
-        fprintf(stderr,
+        proc_log(
             "Error: --ch2 requested but input is single-tuner (no second tuner).\n");
-        fclose(fin); return EXIT_FAILURE;
+        fclose(fin); return 1;
     }
 
     /* Validate: can't request dual output from single-tuner input */
@@ -1285,15 +1608,17 @@ int main(int argc, char *argv[])
     }
 
     /* Validate: WAV formats not allowed for dual-tuner output */
-    if(out_is_dual && (out_fmt==FMT_SDRUNO||out_fmt==FMT_SDRCONNECT)){
-        fprintf(stderr,
+    if(out_is_dual && (out_fmt==FMT_SDRUNO||out_fmt==FMT_SDRCONNECT||
+                       out_fmt==FMT_PERSEUS||out_fmt==FMT_JAGUAR)){
+        proc_log(
             "Error: dual-tuner output only supports linrad and wavviewdx formats.\n"
             "  Use --ch1 or --ch2 to extract a single tuner for WAV output.\n");
-        fclose(fin); return EXIT_FAILURE;
+        fclose(fin); return 1;
     }
 
     /* ── Format name strings (used in messages below) ── */
-    const char *fmt_names[]={"Linrad raw","WavViewDX raw","SDRuno WAV","SDR Connect WAV","Unknown"};
+    const char *fmt_names[]={"Linrad raw","WavViewDX raw","SDRuno WAV",
+                              "SDR Connect WAV","Perseus WAV","Jaguar WAV","Unknown"};
 
     /* Validate: same input and output format with no meaningful operation.
      *
@@ -1311,25 +1636,26 @@ int main(int argc, char *argv[])
         if(rec.tuner == TUNER_DUAL && ochan != OUT_DUAL){
             /* Channel extraction from dual to single  -  valid, no message needed */
         } else {
-            printf("Note: input and output are the same format (%s) with no trim, DDC,\n"
+            proc_log("Note: input and output are the same format (%s) with no trim, DDC,\n"
                    "  or channel extraction  -  no conversion required.\n",
                    fmt_names[rec.fmt]);
-            fclose(fin); return EXIT_SUCCESS;
+            fclose(fin); return 0;
         }
     }
 
     /* ── Print input info ── */
-    printf("Input       : %s\n",inpath);
-    printf("Format      : %s\n",fmt_names[rec.fmt]);
-    printf("Tuner       : %s\n",rec.tuner==TUNER_DUAL?"Dual (IA,QA,IB,QB)":"Single (I,Q)");
-    printf("Sample rate : %d Hz\n",rec.sample_rate);
-    printf("Centre freq : %d Hz = %.3f kHz\n",rec.centre_freq_hz,rec.centre_freq_hz/1000.0);
-    printf("Start time  : %04d-%02d-%02d %02d:%02d:%02d UTC\n",
+    proc_log("Input       : %s\n",inpath);
+    proc_log("Format      : %s\n",fmt_names[rec.fmt]);
+    proc_log("Tuner       : %s\n",rec.tuner==TUNER_DUAL?"Dual (IA,QA,IB,QB)":"Single (I,Q)");
+    proc_log("Sample rate : %d Hz\n",rec.sample_rate);
+    proc_log("Centre freq : %d Hz = %.3f kHz\n",rec.centre_freq_hz,rec.centre_freq_hz/1000.0);
+    proc_log("Start time  : %04d-%02d-%02d %02d:%02d:%02d UTC\n",
            rec.year,rec.month,rec.day,rec.hour,rec.minute,rec.second);
 
-    uint64_t total_secs=rec.data_bytes/((uint64_t)rec.num_channels*2*(uint64_t)rec.sample_rate);
-    printf("Duration    : %llu s\n",(unsigned long long)total_secs);
-    printf("Output mode : %s -> %s\n",
+    uint64_t total_frames_in_file = rec.data_bytes / ((uint64_t)rec.num_channels*2);
+    uint64_t total_secs=total_frames_in_file/(uint64_t)rec.sample_rate;
+    proc_log("Duration    : %llu s\n",(unsigned long long)total_secs);
+    proc_log("Output mode : %s -> %s\n",
            ochan==OUT_DUAL?"Dual-tuner":ochan==OUT_CH1?"Tuner A (ch1)":"Tuner B (ch2)",
            fmt_names[out_fmt]);
 
@@ -1339,30 +1665,30 @@ int main(int argc, char *argv[])
     int64_t start_epoch, end_epoch;
 
     if(do_convert){
-        /* No trim  -  process entire file */
+        /* No trim — use exact frame count, not rounded seconds */
         start_epoch = file_epoch;
         end_epoch   = file_epoch + (int64_t)total_secs;
         out_year=rec.year; out_month=rec.month; out_day=rec.day;
     } else {
         /* Resolve start */
-        start_epoch=utc_to_unix(out_year,out_month,out_day,req_start_hh,req_start_mm,0);
+        start_epoch=utc_to_unix(out_year,out_month,out_day,req_start_hh,req_start_mm,req_start_ss);
         if(start_epoch<file_epoch){
             next_day(&out_year,&out_month,&out_day);
-            start_epoch=utc_to_unix(out_year,out_month,out_day,req_start_hh,req_start_mm,0);
-            printf("Note: start %02d:%02d past midnight  -  using %04d-%02d-%02d\n",
-                   req_start_hh,req_start_mm,out_year,out_month,out_day);
+            start_epoch=utc_to_unix(out_year,out_month,out_day,req_start_hh,req_start_mm,req_start_ss);
+            proc_log("Note: start %02d:%02d:%02d past midnight  -  using %04d-%02d-%02d\n",
+                   req_start_hh,req_start_mm,req_start_ss,out_year,out_month,out_day);
         }
         if(start_epoch<file_epoch){
-            fprintf(stderr,"Error: start time is before file start.\n");
-            fclose(fin); return EXIT_FAILURE; }
+            proc_log("Error: start time is before file start.\n");
+            fclose(fin); return 1; }
 
         /* Resolve end */
         int end_year=out_year, end_month=out_month, end_day=out_day;
-        end_epoch=utc_to_unix(end_year,end_month,end_day,req_end_hh,req_end_mm,0);
+        end_epoch=utc_to_unix(end_year,end_month,end_day,req_end_hh,req_end_mm,req_end_ss);
         if(end_epoch<=start_epoch){
             next_day(&end_year,&end_month,&end_day);
-            end_epoch=utc_to_unix(end_year,end_month,end_day,req_end_hh,req_end_mm,0);
-            printf("Note: end %02d:%02d <= start  -  using %04d-%02d-%02d\n",
+            end_epoch=utc_to_unix(end_year,end_month,end_day,req_end_hh,req_end_mm,req_end_ss);
+            proc_log("Note: end %02d:%02d <= start  -  using %04d-%02d-%02d\n",
                    req_end_hh,req_end_mm,end_year,end_month,end_day);
         }
 
@@ -1370,19 +1696,24 @@ int main(int argc, char *argv[])
         if(end_epoch>file_end){
             int fe_hh,fe_mm,fe_ss,fe_yy,fe_mo,fe_dd;
             unix_to_utc(file_end,&fe_yy,&fe_mo,&fe_dd,&fe_hh,&fe_mm,&fe_ss);
-            fprintf(stderr,"Error: end time %02d:%02d is beyond the end of the recording.\n"
+            proc_log("Error: end time %02d:%02d is beyond the end of the recording.\n"
                     "  Recording ends at %02d:%02d UTC on %04d-%02d-%02d.\n",
                     req_end_hh,req_end_mm,fe_hh,fe_mm,fe_yy,fe_mo,fe_dd);
-            fclose(fin); return EXIT_FAILURE; }
+            fclose(fin); return 1; }
     }
 
-    int64_t duration_sec  = end_epoch - start_epoch;
-    if(duration_sec<=0){
-        fprintf(stderr,"Error: zero or negative duration.\n");
-        fclose(fin); return EXIT_FAILURE; }
-
     uint64_t start_frame =(uint64_t)(start_epoch-file_epoch)*(uint64_t)rec.sample_rate;
-    uint64_t in_frames   =(uint64_t)duration_sec*(uint64_t)rec.sample_rate;
+    uint64_t in_frames;
+    if(do_convert){
+        /* Full file: use exact frame count to avoid losing fractional seconds */
+        in_frames = total_frames_in_file - start_frame;
+    } else {
+        int64_t duration_sec  = end_epoch - start_epoch;
+        if(duration_sec<=0){
+            proc_log("Error: zero or negative duration.\n");
+            fclose(fin); return 1; }
+        in_frames = (uint64_t)duration_sec*(uint64_t)rec.sample_rate;
+    }
 
     /* ── DDC setup ── */
     int    ddc_D=1, fs_out=rec.sample_rate;
@@ -1399,14 +1730,14 @@ int main(int argc, char *argv[])
 
         double cutoff_norm=(ddc_bw_khz*1000.0/2.0)/rec.sample_rate;
         fir_h=design_fir(cutoff_norm,cutoff_norm*0.15,80.0,&n_taps);
-        if(!fir_h){ perror("malloc FIR"); fclose(fin); return EXIT_FAILURE; }
+        if(!fir_h){ proc_perror("malloc FIR"); fclose(fin); return 1; }
 
         delta_phi=2.0*M_PI*(double)(rec.centre_freq_hz-ddc_cf_hz)/(double)rec.sample_rate;
 
-        printf("DDC centre  : %d kHz\n",ddc_freq_khz);
-        printf("DDC BW      : %d kHz\n",ddc_bw_khz);
-        printf("Decimation  : %d -> output rate %d Hz\n",ddc_D,fs_out);
-        printf("FIR taps    : %d\n",n_taps);
+        proc_log("DDC centre  : %d kHz\n",ddc_freq_khz);
+        proc_log("DDC BW      : %d kHz\n",ddc_bw_khz);
+        proc_log("Decimation  : %d -> output rate %d Hz\n",ddc_D,fs_out);
+        proc_log("FIR taps    : %d\n",n_taps);
     }
 
     uint64_t out_frames = in_frames/(uint64_t)(do_ddc?ddc_D:1);
@@ -1415,10 +1746,10 @@ int main(int argc, char *argv[])
     int out_ch = (ochan==OUT_DUAL) ? rec.num_channels : 2;
 
     /* Trim info */
-    int trim_sh=req_start_hh, trim_sm=req_start_mm;
+    int trim_sh=req_start_hh, trim_sm=req_start_mm, trim_ss=req_start_ss;
     int trim_eh=req_end_hh,   trim_em=req_end_mm;
     if(do_convert){
-        trim_sh=rec.hour; trim_sm=rec.minute;
+        trim_sh=rec.hour; trim_sm=rec.minute; trim_ss=rec.second;
         int64_t e2=file_epoch+(int64_t)total_secs;
         int ey,em,ed,eh,emi,es;
         unix_to_utc(e2,&ey,&em,&ed,&eh,&emi,&es);
@@ -1431,37 +1762,54 @@ int main(int argc, char *argv[])
                 &(int){0});
 
     /* ── Build output filename ── */
+    /* Extract input file directory to place output alongside input */
+    char outdir[512]={0};
+    {
+        const char *sl=strrchr(inpath,'\\');
+        if(!sl) sl=strrchr(inpath,'/');
+        if(sl){ size_t dlen=(size_t)(sl-inpath)+1;
+                if(dlen<sizeof(outdir)){ memcpy(outdir,inpath,dlen); outdir[dlen]='\0'; } }
+    }
+    char outbase[512];
     char outpath[512];
     switch(out_fmt){
         case FMT_LINRAD:
-            build_linrad_filename(outpath,sizeof(outpath),
+            build_linrad_filename(outbase,sizeof(outbase),
                 out_year,out_month,out_day,
-                trim_sh,trim_sm,0,
+                trim_sh,trim_sm,trim_ss,
                 rec.utc_offset,ddc_cf_hz,out_ch);
             break;
         case FMT_WAVVIEWDX:
-            build_wavviewdx_filename(outpath,sizeof(outpath),
+            build_wavviewdx_filename(outbase,sizeof(outbase),
                 out_year,out_month,out_day,
-                trim_sh,trim_sm,0,
+                trim_sh,trim_sm,trim_ss,
                 ddc_cf_hz,fs_out,out_ch);
             /* append .raw */
-            { size_t n=strlen(outpath);
-              if(n+4<sizeof(outpath)) strcat(outpath,".raw"); }
+            { size_t n=strlen(outbase);
+              if(n+4<sizeof(outbase)) strcat(outbase,".raw"); }
             break;
         case FMT_SDRUNO:
-            build_sdruno_filename(outpath,sizeof(outpath),
+            build_sdruno_filename(outbase,sizeof(outbase),
                 out_year,out_month,out_day,
-                trim_sh,trim_sm,0,
-                ddc_cf_hz,ochan);
-            break;
-        case FMT_SDRCONNECT:
-            build_sdrconnect_filename(outpath,sizeof(outpath),
-                out_year,out_month,out_day,
-                trim_sh,trim_sm,0,
+                trim_sh,trim_sm,trim_ss,
                 ddc_cf_hz);
             break;
-        default: break;
+        case FMT_SDRCONNECT:
+            build_sdrconnect_filename(outbase,sizeof(outbase),
+                out_year,out_month,out_day,
+                trim_sh,trim_sm,trim_ss,
+                ddc_cf_hz);
+            break;
+        case FMT_PERSEUS:
+        case FMT_JAGUAR:
+            build_rcvr_filename(outbase,sizeof(outbase),
+                out_year,out_month,out_day,
+                trim_sh,trim_sm,trim_ss,
+                ddc_cf_hz,out_fmt);
+            break;
+        default: outbase[0]='\0'; break;
     }
+    snprintf(outpath,sizeof(outpath),"%s%s",outdir,outbase);
 
     /* Prevent input overwrite.
      * If the computed output name matches the input, append _cvt before
@@ -1484,33 +1832,100 @@ int main(int argc, char *argv[])
                 size_t n=strlen(outpath);
                 if(n+4<sizeof(outpath)) strcat(outpath,"_cvt");
             }
-            printf("Note: output name matched input -- renamed to: %s\n",outpath);
+            proc_log("Note: output name matched input -- renamed to: %s\n",outpath);
         }
     }
-    printf("Output file : %s\n\n",outpath);
+
+    /* Check if output file already exists — ask user via main thread */
+    {
+        FILE *ftest=fopen(outpath,"rb");
+        if(ftest){
+            fclose(ftest);
+            wchar_t *wpath=(wchar_t*)malloc(512*sizeof(wchar_t));
+            if(wpath){
+                MultiByteToWideChar(CP_UTF8,0,outpath,-1,wpath,512);
+                /* SendMessage is synchronous — blocks until user responds */
+                LRESULT r=SendMessageW(g_proc_hwnd,WM_CONFIRM_OW,0,(LPARAM)wpath);
+                /* wpath is freed by the handler */
+                if(r!=IDYES){
+                    proc_log("Cancelled — output file already exists.\n");
+                    fclose(fin); free(fir_h); return 1;
+                }
+            }
+        }
+    }
+    proc_log("Output file : %s\n\n",outpath);
 
     /* ── Seek input to trim start ── */
     uint64_t skip_bytes=start_frame*(uint64_t)rec.num_channels*2;
     if(file_seek(fin,rec.data_offset+(int64_t)skip_bytes,SEEK_SET)!=0){
-        fprintf(stderr,"Error seeking: %s\n",strerror(errno));
-        free(fir_h); fclose(fin); return EXIT_FAILURE; }
+        proc_log("Error seeking: %s\n",strerror(errno));
+        free(fir_h); fclose(fin); return 1; }
 
     /* ── Open output ── */
     FILE *fout=fopen(outpath,"wb");
     if(!fout){
-        fprintf(stderr,"Error creating '%s': %s\n",outpath,strerror(errno));
-        free(fir_h); fclose(fin); return EXIT_FAILURE; }
+        proc_log("Error creating '%s': %s\n",outpath,strerror(errno));
+        free(fir_h); fclose(fin); return 1; }
 
     /* ── Write output header ── */
     int64_t ds64_pos=-1, data_sz32_pos=-1;
     int use_rf64=0;
     uint64_t out_data_bytes=out_frames*(uint64_t)out_ch*2;
 
+    /* Determine resampling need early — required by size check below */
+    int need_resamp = 0;
+    int resamp_target = fs_out;
+    if(!do_ddc){
+        if(out_fmt==FMT_JAGUAR && rec.sample_rate!=1600000){
+            need_resamp=1; resamp_target=1600000;
+        } else if(out_fmt==FMT_PERSEUS && rec.sample_rate!=1999000){
+            need_resamp=1; resamp_target=1999000;
+        }
+    }
+
+    /* Perseus/Jaguar: check output won't exceed 4GB (no RF64 support) */
+    if(out_fmt==FMT_PERSEUS||out_fmt==FMT_JAGUAR){
+        uint64_t target_sr = (out_fmt==FMT_JAGUAR)?1600000:1999000;
+        if(need_resamp) target_sr=resamp_target;
+        uint64_t max_data = 0xFFFFFFFFULL - 86;
+        uint64_t expected_bytes = out_frames*(uint64_t)out_ch*2;
+        /* Adjust for resampling ratio */
+        if(need_resamp)
+            expected_bytes=(uint64_t)((double)out_frames*(double)resamp_target
+                            /rec.sample_rate*(uint64_t)out_ch*2);
+        if(expected_bytes > max_data){
+            proc_log("Error: %s output would exceed 4 GB (%.1f GB).\n"
+                     "  Maximum duration at this sample rate: %.0f seconds.\n"
+                     "  Use Trim mode to select a shorter section.\n",
+                     out_fmt==FMT_JAGUAR?"Jaguar":"Perseus",
+                     (double)expected_bytes/1e9,
+                     (double)max_data/(target_sr*4));
+            fclose(fin); free(fir_h); return 1;
+        }
+    }
+
+    /* Perseus<->Jaguar cross-conversion is blocked: SDR Console hardcodes
+     * different sample rates for each (Jaguar=2MHz, Perseus=1.999MHz) making
+     * frequency-accurate conversion mathematically impossible. */
+    if(!do_ddc &&
+       ((rec.fmt==FMT_PERSEUS && out_fmt==FMT_JAGUAR) ||
+        (rec.fmt==FMT_JAGUAR  && out_fmt==FMT_PERSEUS))){
+        proc_log("Error: Perseus<->Jaguar conversion is not supported.\n"
+                 "  SDR Console hardcodes different sample rates for each format,\n"
+                 "  making frequency-accurate conversion impossible.\n"
+                 "  Convert to linrad, wavviewdx, sdruno or sdrconnect instead.\n");
+        fclose(fin); if(fout) fclose(fout); free(fir_h); return 1;
+    }
+
+    /* Resampling: currently no cross-format resampling needed beyond the
+     * blocked Perseus<->Jaguar case. Future HDSDR support will use this. */
+
     /* Warn if SDR Connect output would require RF64 */
     if(out_fmt==FMT_SDRCONNECT){
         uint64_t overhead=80;
         if(out_data_bytes >= 0xFFFFFFFFULL-overhead){
-            fprintf(stderr,
+            proc_log(
                 "Warning: SDR Connect output exceeds 4 GB and will be written as RF64.\n");
         }
     }
@@ -1533,19 +1948,27 @@ int main(int argc, char *argv[])
             uint8_t hbuf[LINRAD_HDR_SIZE];
             linrad_to_bytes(&oh,hbuf);
             if(fwrite(hbuf,1,LINRAD_HDR_SIZE,fout)!=LINRAD_HDR_SIZE){
-                fprintf(stderr,"Error writing header.\n"); goto write_error; }
+                proc_log("Error writing header.\n"); goto write_error; }
             break; }
         case FMT_WAVVIEWDX:
             /* Headerless  -  nothing to write */
             break;
         case FMT_SDRUNO:
         case FMT_SDRCONNECT:
+        case FMT_PERSEUS:
+        case FMT_JAGUAR: {
+            /* Write the rate the playback software expects:
+             * Jaguar without DDC: hardcode 1,600,000 Hz (Jaguar software expects this)
+             * Jaguar with DDC: write actual decimated rate (Jaguar reads fmt chunk)
+             * Perseus: always reads fmt chunk so write actual rate */
+            uint32_t hdr_sr = need_resamp ? (uint32_t)resamp_target : (uint32_t)fs_out;
+            if(out_fmt==FMT_JAGUAR && !do_ddc) hdr_sr = 1600000;
             data_sz32_pos=write_wav_header(fout,out_fmt,out_data_bytes,
-                (uint32_t)fs_out,(uint16_t)out_ch,(int32_t)ddc_cf_hz,
-                out_year,out_month,out_day,trim_sh,trim_sm,
-                end_yy,end_mm2,end_dd,end_hh2,end_mi2,
-                outpath,&use_rf64,&ds64_pos);
-            break;
+                hdr_sr,(uint16_t)out_ch,(int32_t)ddc_cf_hz,
+                out_year,out_month,out_day,trim_sh,trim_sm,trim_ss,
+                end_yy,end_mm2,end_dd,end_hh2,end_mi2,end_ss2,
+                outpath,&rec.rcvr,&use_rf64,&ds64_pos);
+            break; }
         default: break;
     }
 
@@ -1557,6 +1980,10 @@ int main(int argc, char *argv[])
     if(do_ddc){
         rc=copy_ddc(fin,fout,in_frames,rec.num_channels,out_ch,
                     fir_h,n_taps,ddc_D,delta_phi,ochan,label);
+    } else if(need_resamp){
+        rc=copy_resample(fin,fout,in_frames,rec.num_channels,out_ch,
+                         rec.sample_rate,resamp_target,ochan,label);
+        fs_out=resamp_target;
     } else {
         rc=copy_passthrough(fin,fout,in_frames,rec.num_channels,out_ch,
                             src_idx,label);
@@ -1564,17 +1991,1638 @@ int main(int argc, char *argv[])
     if(rc!=0) goto write_error;
 
     /* ── Finalise WAV headers ── */
-    if(out_fmt==FMT_SDRUNO||out_fmt==FMT_SDRCONNECT){
+    if(out_fmt==FMT_SDRUNO||out_fmt==FMT_SDRCONNECT||
+       out_fmt==FMT_PERSEUS||out_fmt==FMT_JAGUAR){
         finalise_wav(fout,use_rf64,ds64_pos,data_sz32_pos,out_ch);
     }
 
     fclose(fin); fclose(fout); free(fir_h);
-    printf("Done. Output: %s\n",outpath);
-    return EXIT_SUCCESS;
+    proc_log("Done. Output: %s\n",outpath);
+    return 0;
 
 write_error:
-    fprintf(stderr,"Fatal error  -  removing partial output.\n");
+    proc_log("Fatal error  -  removing partial output.\n");
     fclose(fin); fclose(fout); free(fir_h);
     remove(outpath);
-    return EXIT_FAILURE;
+    return 1;
+}
+
+
+
+/* ListView columns */
+#define COL_NUM     0
+#define COL_INPUT   1
+#define COL_OP      2
+#define COL_OUTPUT  3
+#define COL_STATUS  4
+
+/* ------------------------------------------------------------------ */
+/*  Colours                                                            */
+/* ------------------------------------------------------------------ */
+#define CLR_HEADER_BG   RGB(45,  45,  48)
+#define CLR_HEADER_TEXT RGB(240, 240, 240)
+#define CLR_RUN_BG      RGB(0,   120, 215)
+#define CLR_RUN_HOT     RGB(0,   102, 180)
+#define CLR_RUN_TEXT    RGB(255, 255, 255)
+#define CLR_BG          RGB(245, 245, 245)
+#define CLR_SEG_ON      RGB(0,   180,   0)
+#define CLR_SEG_OFF     RGB(220, 220, 220)
+
+/* ------------------------------------------------------------------ */
+/*  Batch job structure                                                */
+/* ------------------------------------------------------------------ */
+#define MAX_JOBS 64
+typedef struct {
+    wchar_t cmdline[4096];
+    wchar_t op_desc[128];
+    wchar_t input_short[64];
+    wchar_t output_short[64];
+    wchar_t output_full[MAX_PATH]; /* full path for overwrite check */
+    wchar_t status[32];
+} BatchJob;
+
+/* ------------------------------------------------------------------ */
+/*  Globals                                                            */
+/* ------------------------------------------------------------------ */
+static HWND      g_hwnd;
+static int       g_sample_rate = 0;  /* sample rate of currently loaded file */
+static HINSTANCE g_hinst;
+static BOOL      g_running    = FALSE;
+static BOOL      g_batch_run  = FALSE;
+static HANDLE    g_thread     = NULL;
+static HANDLE    g_hprocess   = NULL;
+static int       g_progress   = 0;
+static int       g_header_h   = 52;
+static HBRUSH    g_hbr_bg     = NULL;
+static HBRUSH    g_hbr_header = NULL;
+static HFONT     g_font       = NULL;
+static HFONT     g_font_bold  = NULL;
+static HFONT     g_font_mono  = NULL;
+static HFONT     g_font_title = NULL;
+static wchar_t   g_exedir[MAX_PATH];
+
+static BatchJob  g_jobs[MAX_JOBS];
+static int       g_job_count  = 0;
+
+/* ------------------------------------------------------------------ */
+/*  INI helpers                                                        */
+/* ------------------------------------------------------------------ */
+static void ini_path(wchar_t *buf,int n)
+{ _snwprintf(buf,n,L"%s\\sdrtrim.ini",g_exedir); }
+
+static void ini_ws(const wchar_t *sec,const wchar_t *key,const wchar_t *val)
+{ wchar_t p[MAX_PATH]; ini_path(p,MAX_PATH); WritePrivateProfileStringW(sec,key,val,p); }
+
+static void ini_wi(const wchar_t *sec,const wchar_t *key,int v)
+{ wchar_t b[32]; _snwprintf(b,32,L"%d",v); ini_ws(sec,key,b); }
+
+static void ini_rs(const wchar_t *sec,const wchar_t *key,const wchar_t *def,wchar_t *buf,int n)
+{ wchar_t p[MAX_PATH]; ini_path(p,MAX_PATH); GetPrivateProfileStringW(sec,key,def,buf,n,p); }
+
+static int ini_ri(const wchar_t *sec,const wchar_t *key,int def)
+{ wchar_t p[MAX_PATH]; ini_path(p,MAX_PATH); return (int)GetPrivateProfileIntW(sec,key,def,p); }
+
+/* ------------------------------------------------------------------ */
+/*  Save / restore settings                                            */
+/* ------------------------------------------------------------------ */
+static void update_channel_controls(void);  /* forward declaration */
+static void update_format_controls(void);    /* forward declaration */
+static void update_run_batch_button(void);   /* forward declaration */
+
+static void save_settings(void)
+{
+    wchar_t b[MAX_PATH];
+    ini_wi(L"S",L"Trim",  IsDlgButtonChecked(g_hwnd,ID_MODE_TRIM)?1:0);
+    GetWindowTextW(GetDlgItem(g_hwnd,ID_START_EDIT),b,10); ini_ws(L"S",L"Start",b);
+    GetWindowTextW(GetDlgItem(g_hwnd,ID_END_EDIT),  b,10); ini_ws(L"S",L"End",  b);
+    ini_wi(L"S",L"Chan",
+        IsDlgButtonChecked(g_hwnd,ID_CHAN_CH1)?1:
+        IsDlgButtonChecked(g_hwnd,ID_CHAN_CH2)?2:0);
+    ini_wi(L"S",L"Fmt",
+        IsDlgButtonChecked(g_hwnd,ID_FMT_LINRAD)    ?1:
+        IsDlgButtonChecked(g_hwnd,ID_FMT_WAVVIEWDX) ?2:
+        IsDlgButtonChecked(g_hwnd,ID_FMT_SDRUNO)    ?3:
+        IsDlgButtonChecked(g_hwnd,ID_FMT_SDRCONNECT)?4:
+        IsDlgButtonChecked(g_hwnd,ID_FMT_PERSEUS)?5:
+        IsDlgButtonChecked(g_hwnd,ID_FMT_JAGUAR)?6:0);
+    ini_wi(L"S",L"DDC", IsDlgButtonChecked(g_hwnd,ID_DDC_CHECK)?1:0);
+    GetWindowTextW(GetDlgItem(g_hwnd,ID_DDC_CENTRE),b,16); ini_ws(L"S",L"DDCcf",b);
+    { HWND hcb=GetDlgItem(g_hwnd,ID_DDC_BW);
+      int sel=(int)SendMessageW(hcb,CB_GETCURSEL,0,0);
+      wchar_t bwlbl[32]={0};
+      if(sel>=0) SendMessageW(hcb,CB_GETLBTEXT,sel,(LPARAM)bwlbl);
+      ini_ws(L"S",L"DDCbw",bwlbl); }
+}
+
+static void restore_settings(void)
+{
+    wchar_t b[MAX_PATH];
+    int trim=ini_ri(L"S",L"Trim",0);
+    CheckRadioButton(g_hwnd,ID_MODE_FULL,ID_MODE_TRIM,trim?ID_MODE_TRIM:ID_MODE_FULL);
+    EnableWindow(GetDlgItem(g_hwnd,ID_START_EDIT),trim);
+    EnableWindow(GetDlgItem(g_hwnd,ID_END_EDIT),  trim);
+    ini_rs(L"S",L"Start",L"",b,10); SetWindowTextW(GetDlgItem(g_hwnd,ID_START_EDIT),b);
+    ini_rs(L"S",L"End",  L"",b,10); SetWindowTextW(GetDlgItem(g_hwnd,ID_END_EDIT),  b);
+    int chan=ini_ri(L"S",L"Chan",0);
+    CheckRadioButton(g_hwnd,ID_CHAN_DUAL,ID_CHAN_CH2,
+        chan==1?ID_CHAN_CH1:chan==2?ID_CHAN_CH2:ID_CHAN_DUAL);
+    int fmt=ini_ri(L"S",L"Fmt",0);
+    CheckRadioButton(g_hwnd,ID_FMT_SAME,ID_FMT_JAGUAR,
+        fmt==1?ID_FMT_LINRAD:fmt==2?ID_FMT_WAVVIEWDX:
+        fmt==3?ID_FMT_SDRUNO:fmt==4?ID_FMT_SDRCONNECT:
+        fmt==5?ID_FMT_PERSEUS:fmt==6?ID_FMT_JAGUAR:ID_FMT_SAME);
+    int ddc=ini_ri(L"S",L"DDC",0);
+    CheckDlgButton(g_hwnd,ID_DDC_CHECK,ddc?BST_CHECKED:BST_UNCHECKED);
+    EnableWindow(GetDlgItem(g_hwnd,ID_DDC_CENTRE),ddc);
+    EnableWindow(GetDlgItem(g_hwnd,ID_DDC_BW),    ddc);
+    ini_rs(L"S",L"DDCcf",L"",b,16); SetWindowTextW(GetDlgItem(g_hwnd,ID_DDC_CENTRE),b);
+    /* DDCbw is restored by populate_bw_dropdown when file is loaded */
+    update_format_controls();
+}
+
+/* ------------------------------------------------------------------ */
+/*  Log helpers                                                        */
+/* ------------------------------------------------------------------ */
+static void log_append(const wchar_t *t)
+{
+    HWND h=GetDlgItem(g_hwnd,ID_LOG_EDIT);
+    int n=GetWindowTextLengthW(h);
+    SendMessageW(h,EM_SETSEL,n,n);
+    SendMessageW(h,EM_REPLACESEL,FALSE,(LPARAM)t);
+    int lines=(int)SendMessageW(h,EM_GETLINECOUNT,0,0);
+    SendMessageW(h,EM_LINESCROLL,0,lines);
+}
+static void log_clear(void){ SetWindowTextW(GetDlgItem(g_hwnd,ID_LOG_EDIT),L""); }
+
+/* ------------------------------------------------------------------ */
+/*  Output filename prediction — file probing                         */
+/* ------------------------------------------------------------------ */
+typedef struct {
+    int  fmt;
+    int  dual;
+    int  sample_rate;
+    int  centre_hz;
+    int  year,mon,day,hour,min,sec;
+    int  utc_digit;
+} FileInfo;
+
+static uint32_t rd32(const uint8_t *b){ return (uint32_t)b[0]|((uint32_t)b[1]<<8)|((uint32_t)b[2]<<16)|((uint32_t)b[3]<<24); }
+static uint16_t rd16(const uint8_t *b){ return (uint16_t)b[0]|((uint16_t)b[1]<<8); }
+
+
+
+
+
+static BOOL probe_file(const wchar_t *path,FileInfo *fi)
+{
+    memset(fi,0,sizeof(*fi)); fi->fmt=-1;
+    FILE *f=_wfopen(path,L"rb");
+    if(!f) return FALSE;
+    /* Read enough to cover large JUNK chunks (SDR Connect uses 28-byte JUNK,
+       but read generously in case of variation) */
+    uint8_t hdr[1024]; size_t got=fread(hdr,1,sizeof(hdr),f);
+    fclose(f);
+    if(got<12) return FALSE;
+
+    /* ── Linrad raw: magic FF FF FF FF ── */
+    if(hdr[0]==0xFF&&hdr[1]==0xFF&&hdr[2]==0xFF&&hdr[3]==0xFF){        fi->fmt=0;
+        uint64_t u64=0; for(int i=0;i<8;i++) u64|=(uint64_t)hdr[12+i]<<(i*8);
+        double pc; memcpy(&pc,&u64,8); fi->centre_hz=(int)(pc*1e6+0.5);
+        fi->dual=(rd32(hdr+32)==4)?1:0;
+        fi->sample_rate=(int)rd32(hdr+36);
+        u64=0; for(int i=0;i<8;i++) u64|=(uint64_t)hdr[4+i]<<(i*8);
+        double ts; memcpy(&ts,&u64,8); int64_t ep=(int64_t)ts;
+        unix_to_utc(ep,&fi->year,&fi->mon,&fi->day,&fi->hour,&fi->min,&fi->sec);
+        const wchar_t *bn=wcsrchr(path,L'\\'); if(!bn)bn=path; else bn++;
+        if(wcslen(bn)>16){ wchar_t uc=bn[15]; fi->utc_digit=(uc>=L'0'&&uc<=L'9')?(int)(uc-L'0'):0; }
+        return TRUE;
+    }
+
+    /* ── RIFF/WAVE and RF64 formats ── */
+    int is_rf64 = (hdr[0]=='R'&&hdr[1]=='F'&&hdr[2]=='6'&&hdr[3]=='4'&&
+                   hdr[8]=='W'&&hdr[9]=='A'&&hdr[10]=='V'&&hdr[11]=='E');
+    int is_riff = (hdr[0]=='R'&&hdr[1]=='I'&&hdr[2]=='F'&&hdr[3]=='F'&&
+                   hdr[8]=='W'&&hdr[9]=='A'&&hdr[10]=='V'&&hdr[11]=='E');
+    if(is_riff||is_rf64){
+
+        /* Walk chunks from offset 12 */
+        uint32_t pos=12;
+        int have_fmt=0;
+        BOOL is_sdrconnect=0;
+
+        while(pos+8<=(uint32_t)got){
+            char id[5]={0}; memcpy(id,hdr+pos,4);
+            uint32_t csz=rd32(hdr+pos+4);
+
+            if(memcmp(id,"JUNK",4)==0){
+                /* SDR Connect marker */
+                is_sdrconnect=1;
+                pos+=8+csz;
+                continue;
+            }
+            if(memcmp(id,"fmt ",4)==0){
+                /* PCM fmt: channels at +2, sample_rate at +4 (all relative to chunk data start) */
+                if(pos+8+10<=(uint32_t)got){
+                    fi->sample_rate=(int)rd32(hdr+pos+12);  /* pos+8+4 */
+                    uint16_t nch=rd16(hdr+pos+10);           /* pos+8+2 */
+                    fi->dual=(nch==4)?1:0;
+                }
+                have_fmt=1;
+                pos+=8+csz; if(csz&1)pos++;
+                continue;
+            }
+            if(memcmp(id,"auxi",4)==0 && have_fmt){
+                /* SDRuno auxi chunk: SYSTEMTIME start (16 bytes) at chunk data */
+                /* SYSTEMTIME: wYear(2) wMonth(2) wDayOfWeek(2) wDay(2)
+                               wHour(2) wMinute(2) wSecond(2) wMilliseconds(2) */
+                uint32_t ad=pos+8; /* auxi data start */
+                if(ad+40<=(uint32_t)got){
+                    fi->year =(int)rd16(hdr+ad+0);
+                    fi->mon  =(int)rd16(hdr+ad+2);
+                    /* ad+4 = wDayOfWeek, skip */
+                    fi->day  =(int)rd16(hdr+ad+6);
+                    fi->hour =(int)rd16(hdr+ad+8);
+                    fi->min  =(int)rd16(hdr+ad+10);
+                    fi->sec  =(int)rd16(hdr+ad+12);
+                    /* centre_freq at ad+32 (after start SYSTEMTIME(16) + stop SYSTEMTIME(16)) */
+                    fi->centre_hz=(int)(int32_t)rd32(hdr+ad+32);
+                }
+                fi->fmt=2; /* SDRuno */
+                /* If auxi gave zero date, fall back to filename */
+                if(fi->year==0){
+                    const wchar_t *bn=wcsrchr(path,L'\\'); if(!bn)bn=path; else bn++;
+                    wchar_t stem[MAX_PATH]; wcsncpy(stem,bn,MAX_PATH-1);
+                    wchar_t *dot=wcsrchr(stem,L'.'); if(dot)*dot=L'\0';
+                    int cf_khz=0;
+                    if(swscanf(stem,L"SDRuno_%4d%2d%2d_%2d%2d%2dZ_%dkHz",
+                        &fi->year,&fi->mon,&fi->day,&fi->hour,&fi->min,&fi->sec,&cf_khz)<7)
+                        swscanf(stem,L"SDRuno_%4d%2d%2d_%2d%2d%2d_%dkHz",
+                        &fi->year,&fi->mon,&fi->day,&fi->hour,&fi->min,&fi->sec,&cf_khz);
+                    if(cf_khz>0&&fi->centre_hz==0) fi->centre_hz=cf_khz*1000;
+                }
+                return TRUE;
+            }
+            if(memcmp(id,"rcvr",4)==0 && have_fmt){
+                /* Perseus (flags=4) or Jaguar (flags=5) */
+                uint32_t ad=pos+8;
+                if(ad+12<=(uint32_t)got){
+                    fi->centre_hz=(int)rd32(hdr+ad+0);
+                    uint32_t flags=rd32(hdr+ad+4);
+                    uint32_t ts  =rd32(hdr+ad+8);
+                    fi->fmt=(flags==5)?5:4;  /* 4=Perseus, 5=Jaguar */
+                    int64_t ep=(int64_t)ts;
+                    unix_to_utc(ep,&fi->year,&fi->mon,&fi->day,
+                                   &fi->hour,&fi->min,&fi->sec);
+                }
+                return TRUE;
+            }
+            if(memcmp(id,"data",4)==0) break;
+            pos+=8+csz; if(csz&1)pos++;
+        }
+
+        /* If we found a fmt chunk but no auxi: SDR Connect */
+        if(have_fmt && is_sdrconnect){
+            fi->fmt=3;
+            /* Metadata from filename */
+            const wchar_t *bn=wcsrchr(path,L'\\'); if(!bn)bn=path; else bn++;
+            wchar_t stem[MAX_PATH]; wcsncpy(stem,bn,MAX_PATH-1);
+            wchar_t *dot=wcsrchr(stem,L'.'); if(dot)*dot=L'\0';
+            int ff=0;
+            swscanf(stem,L"SDRconnect_IQ_%4d%2d%2d_%2d%2d%2d_%dHZ",
+                &fi->year,&fi->mon,&fi->day,&fi->hour,&fi->min,&fi->sec,&ff);
+            fi->centre_hz=ff;
+            return TRUE;
+        }
+        /* SDRuno with no auxi found (data chunk reached first) */
+        if(have_fmt && !is_sdrconnect){
+            fi->fmt=2;
+            /* Try to get timestamp and frequency from filename as fallback */
+            const wchar_t *bn=wcsrchr(path,L'\\'); if(!bn)bn=path; else bn++;
+            wchar_t stem[MAX_PATH]; wcsncpy(stem,bn,MAX_PATH-1);
+            wchar_t *dot=wcsrchr(stem,L'.'); if(dot)*dot=L'\0';
+            int cf_khz=0;
+            if(swscanf(stem,L"SDRuno_%4d%2d%2d_%2d%2d%2dZ_%dkHz",
+                &fi->year,&fi->mon,&fi->day,&fi->hour,&fi->min,&fi->sec,&cf_khz)<7)
+                swscanf(stem,L"SDRuno_%4d%2d%2d_%2d%2d%2d_%dkHz",
+                &fi->year,&fi->mon,&fi->day,&fi->hour,&fi->min,&fi->sec,&cf_khz);
+            if(cf_khz>0&&fi->centre_hz==0) fi->centre_hz=cf_khz*1000;
+            return TRUE;
+        }
+        return FALSE;
+    }
+
+    /* ── WavViewDX raw: headerless, identified by filename ── */
+    {
+        const wchar_t *bn=wcsrchr(path,L'\\'); if(!bn)bn=path; else bn++;
+        wchar_t stem[MAX_PATH]; wcsncpy(stem,bn,MAX_PATH-1);
+        wchar_t *dot=wcsrchr(stem,L'.'); if(dot)*dot=L'\0';
+        wchar_t *pat=wcsstr(stem,L"iq_pcm16_ch");
+        if(pat){
+            fi->fmt=1; int ch=0; swscanf(pat+11,L"%d",&ch); fi->dual=(ch==2)?1:0;
+            wchar_t *cf=wcsstr(pat,L"_cf"); if(cf) swscanf(cf+3,L"%d",&fi->centre_hz);
+            wchar_t *sr=wcsstr(pat,L"_sr"); if(sr) swscanf(sr+3,L"%d",&fi->sample_rate);
+            wchar_t *dt=wcsstr(pat,L"_dt");
+            if(dt) swscanf(dt+3,L"%4d%2d%2d-%2d%2d%2d",
+                &fi->year,&fi->mon,&fi->day,&fi->hour,&fi->min,&fi->sec);
+            return TRUE;
+        }
+    }
+    return FALSE;
+}
+
+static BOOL predict_outfile(const wchar_t *inpath,wchar_t *outfile,int n)
+{
+    FileInfo fi;
+    if(!probe_file(inpath,&fi)) return FALSE;
+    int out_fmt;
+    if     (IsDlgButtonChecked(g_hwnd,ID_FMT_LINRAD))     out_fmt=0;
+    else if(IsDlgButtonChecked(g_hwnd,ID_FMT_WAVVIEWDX))  out_fmt=1;
+    else if(IsDlgButtonChecked(g_hwnd,ID_FMT_SDRUNO))     out_fmt=2;
+    else if(IsDlgButtonChecked(g_hwnd,ID_FMT_SDRCONNECT)) out_fmt=3;
+    else if(IsDlgButtonChecked(g_hwnd,ID_FMT_PERSEUS))    out_fmt=4;
+    else if(IsDlgButtonChecked(g_hwnd,ID_FMT_JAGUAR))     out_fmt=5;
+    else out_fmt=fi.fmt;
+    if(out_fmt<0) out_fmt=0;
+    int dual_out=fi.dual;
+    if(IsDlgButtonChecked(g_hwnd,ID_CHAN_CH1)||IsDlgButtonChecked(g_hwnd,ID_CHAN_CH2)) dual_out=0;
+    int cf=fi.centre_hz;
+    if(IsDlgButtonChecked(g_hwnd,ID_DDC_CHECK)){
+        wchar_t buf[16]; GetWindowTextW(GetDlgItem(g_hwnd,ID_DDC_CENTRE),buf,16);
+        int ddc_cf=_wtoi(buf); if(ddc_cf>0) cf=ddc_cf*1000;
+    }
+    int sy=fi.year,smo=fi.mon,sd=fi.day,sh=fi.hour,smi=fi.min;
+    if(IsDlgButtonChecked(g_hwnd,ID_MODE_TRIM)){
+        wchar_t buf[8]; int hh=0,mm=0;
+        GetWindowTextW(GetDlgItem(g_hwnd,ID_START_EDIT),buf,8);
+        int hh_s=0;
+        if(wcslen(buf)==6) swscanf(buf,L"%2d%2d%2d",&hh,&mm,&hh_s);
+        else if(wcslen(buf)==4) swscanf(buf,L"%2d%2d",&hh,&mm); /* backwards compat */
+        int64_t file_ep=utc_to_unix(fi.year,fi.mon,fi.day,fi.hour,fi.min,fi.sec);
+        int64_t start_ep=utc_to_unix(fi.year,fi.mon,fi.day,hh,mm,hh_s);
+        if(start_ep<file_ep){
+            int64_t next=start_ep+86400; int dummy_s;
+            unix_to_utc(next,&sy,&smo,&sd,&sh,&smi,&dummy_s);
+            smi=mm; sh=hh;
+        } else { sy=fi.year; smo=fi.mon; sd=fi.day; sh=hh; smi=mm; }
+    }
+    int sr=fi.sample_rate;
+    if(IsDlgButtonChecked(g_hwnd,ID_DDC_CHECK)){
+        HWND hcb=GetDlgItem(g_hwnd,ID_DDC_BW);
+        int sel=(int)SendMessageW(hcb,CB_GETCURSEL,0,0);
+        if(sel>=0){
+            int D_val=(int)SendMessageW(hcb,CB_GETITEMDATA,sel,0);
+            if(D_val>0 && sr>0) sr=sr/D_val;
+        }
+    }
+    wchar_t name[MAX_PATH];
+    OutputChan ochan = IsDlgButtonChecked(g_hwnd,ID_CHAN_CH2) ? OUT_CH2 :
+                       IsDlgButtonChecked(g_hwnd,ID_CHAN_CH1) ? OUT_CH1 : OUT_DUAL;
+    switch(out_fmt){
+    case 0: _snwprintf(name,MAX_PATH,L"%04d%02d%02d_%02d%02d%02d%d_%dkHz.raw",
+                sy,smo,sd,sh,smi,0,fi.utc_digit,cf/1000); break;
+    case 1: _snwprintf(name,MAX_PATH,L"iq_pcm16_ch%d_cf%d_sr%d_dt%04d%02d%02d-%02d%02d%02d.raw",
+                dual_out?2:1,cf,sr,sy,smo,sd,sh,smi,0); break;
+    case 2: _snwprintf(name,MAX_PATH,L"SDRuno_%04d%02d%02d_%02d%02d%02dZ_%dkHz.wav",
+                sy,smo,sd,sh,smi,0,cf/1000); break;
+    case 3: _snwprintf(name,MAX_PATH,L"SDRconnect_IQ_%04d%02d%02d_%02d%02d%02d_%dHZ.wav",
+                sy,smo,sd,sh,smi,0,cf); break;
+    case 4: _snwprintf(name,MAX_PATH,L"Perseus_%04d%02d%02d_%02d%02d%02dZ_%dkHz.wav",
+                sy,smo,sd,sh,smi,0,cf/1000); break;
+    case 5: _snwprintf(name,MAX_PATH,L"Jaguar_%04d%02d%02d_%02d%02d%02dZ_%dkHz.wav",
+                sy,smo,sd,sh,smi,0,cf/1000); break;
+    default: return FALSE;
+    }
+    wchar_t dir[MAX_PATH]; wcsncpy(dir,inpath,MAX_PATH-1);
+    wchar_t *sl=wcsrchr(dir,L'\\'); if(sl){ sl[1]=L'\0'; } else { dir[0]=L'\0'; }
+    _snwprintf(outfile,n,L"%s%s",dir,name);
+    return TRUE;
+}
+
+/* ------------------------------------------------------------------ */
+/*  Build command line from current GUI state                         */
+/* ------------------------------------------------------------------ */
+static BOOL build_cmdline(wchar_t *cmd,int n)
+{
+    wchar_t input[MAX_PATH];
+    GetWindowTextW(GetDlgItem(g_hwnd,ID_INPUT_EDIT),input,MAX_PATH);
+    if(!input[0]){
+        MessageBoxW(g_hwnd,L"Please select an input file.",L"SDR Trim",MB_OK|MB_ICONWARNING);
+        return FALSE;
+    }
+    /* argv[0] is a placeholder — sdr_process_args ignores it */
+    _snwprintf(cmd,n,L"sdrtrimgui \"%s\"",input);
+    if(IsDlgButtonChecked(g_hwnd,ID_MODE_TRIM)){
+        wchar_t s[10],e[10];
+        GetWindowTextW(GetDlgItem(g_hwnd,ID_START_EDIT),s,10);
+        GetWindowTextW(GetDlgItem(g_hwnd,ID_END_EDIT),  e,10);
+        if((wcslen(s)!=4&&wcslen(s)!=6)||(wcslen(e)!=4&&wcslen(e)!=6)){
+            MessageBoxW(g_hwnd,L"Start and end times must be HHMM or HHMMSS (e.g. 030000).",
+                L"SDR Trim",MB_OK|MB_ICONWARNING);
+            return FALSE;
+        }
+        wchar_t t[MAX_PATH]; _snwprintf(t,MAX_PATH,L"%s %s %s",cmd,s,e);
+        wcsncpy(cmd,t,n-1);
+    }
+    if     (IsDlgButtonChecked(g_hwnd,ID_CHAN_CH1)) wcsncat(cmd,L" --ch1",n-wcslen(cmd)-1);
+    else if(IsDlgButtonChecked(g_hwnd,ID_CHAN_CH2)) wcsncat(cmd,L" --ch2",n-wcslen(cmd)-1);
+    if     (IsDlgButtonChecked(g_hwnd,ID_FMT_LINRAD))     wcsncat(cmd,L" linrad",    n-wcslen(cmd)-1);
+    else if(IsDlgButtonChecked(g_hwnd,ID_FMT_WAVVIEWDX))  wcsncat(cmd,L" wavviewdx", n-wcslen(cmd)-1);
+    else if(IsDlgButtonChecked(g_hwnd,ID_FMT_SDRUNO))     wcsncat(cmd,L" sdruno",    n-wcslen(cmd)-1);
+    else if(IsDlgButtonChecked(g_hwnd,ID_FMT_SDRCONNECT)) wcsncat(cmd,L" sdrconnect",n-wcslen(cmd)-1);
+    else if(IsDlgButtonChecked(g_hwnd,ID_FMT_PERSEUS))    wcsncat(cmd,L" perseus",   n-wcslen(cmd)-1);
+    else if(IsDlgButtonChecked(g_hwnd,ID_FMT_JAGUAR))     wcsncat(cmd,L" jaguar",    n-wcslen(cmd)-1);
+    if(IsDlgButtonChecked(g_hwnd,ID_DDC_CHECK)){
+        wchar_t cf[16],bw[16];
+        GetWindowTextW(GetDlgItem(g_hwnd,ID_DDC_CENTRE),cf,16);
+        { HWND hcb=GetDlgItem(g_hwnd,ID_DDC_BW);
+          int sel=(int)SendMessageW(hcb,CB_GETCURSEL,0,0);
+          if(sel>=0){
+              /* item data = D; recover bw_khz from D and sample rate */
+              int D_val=(int)SendMessageW(hcb,CB_GETITEMDATA,sel,0);
+              if(D_val>0 && g_sample_rate>0){
+                  int fs_out_val=g_sample_rate/D_val;
+                  swprintf(bw,16,L"%d",fs_out_val/1000);
+              }
+          } }
+        if(!cf[0]||!bw[0]){
+            MessageBoxW(g_hwnd,
+                bw[0] ? L"DDC is enabled but no centre frequency is set."
+                       : L"DDC is enabled but no bandwidth is selected.",
+                L"SDR Trim",MB_OK|MB_ICONWARNING);
+            return FALSE;
+        }
+        wchar_t d[64]; _snwprintf(d,64,L" --ddc %s %s",cf,bw);
+        wcsncat(cmd,d,n-wcslen(cmd)-1);
+    }
+    return TRUE;
+}
+
+/* ------------------------------------------------------------------ */
+/*  Build operation description for batch list                        */
+/* ------------------------------------------------------------------ */
+static void build_op_desc(wchar_t *desc,int n)
+{
+    wchar_t parts[128]={0};
+    /* Mode */
+    if(IsDlgButtonChecked(g_hwnd,ID_MODE_TRIM)){
+        wchar_t s[10]={0},e[10]={0};
+        GetWindowTextW(GetDlgItem(g_hwnd,ID_START_EDIT),s,10);
+        GetWindowTextW(GetDlgItem(g_hwnd,ID_END_EDIT),  e,10);
+        _snwprintf(parts,64,L"Trim %s-%s",s,e);
+    } else {
+        wcsncpy(parts,L"Full file",64);
+    }
+    /* Channel */
+    if     (IsDlgButtonChecked(g_hwnd,ID_CHAN_CH1)) wcsncat(parts,L" ch1",128-wcslen(parts)-1);
+    else if(IsDlgButtonChecked(g_hwnd,ID_CHAN_CH2)) wcsncat(parts,L" ch2",128-wcslen(parts)-1);
+    /* Format */
+    const wchar_t *fmt=L"";
+    if     (IsDlgButtonChecked(g_hwnd,ID_FMT_LINRAD))     fmt=L" \u2192 linrad";
+    else if(IsDlgButtonChecked(g_hwnd,ID_FMT_WAVVIEWDX))  fmt=L" \u2192 wavviewdx";
+    else if(IsDlgButtonChecked(g_hwnd,ID_FMT_SDRUNO))     fmt=L" \u2192 sdruno";
+    else if(IsDlgButtonChecked(g_hwnd,ID_FMT_SDRCONNECT)) fmt=L" \u2192 sdrconnect";
+    else if(IsDlgButtonChecked(g_hwnd,ID_FMT_PERSEUS))    fmt=L" \u2192 perseus";
+    else if(IsDlgButtonChecked(g_hwnd,ID_FMT_JAGUAR))     fmt=L" \u2192 jaguar";
+    wcsncat(parts,fmt,128-wcslen(parts)-1);
+    /* DDC */
+    if(IsDlgButtonChecked(g_hwnd,ID_DDC_CHECK)){
+        wchar_t cf[16]={0},bw[16]={0};
+        GetWindowTextW(GetDlgItem(g_hwnd,ID_DDC_CENTRE),cf,16);
+        { HWND hcb=GetDlgItem(g_hwnd,ID_DDC_BW);
+          int sel=(int)SendMessageW(hcb,CB_GETCURSEL,0,0);
+          if(sel>=0){
+              /* item data = D; recover bw_khz from D and sample rate */
+              int D_val=(int)SendMessageW(hcb,CB_GETITEMDATA,sel,0);
+              if(D_val>0 && g_sample_rate>0){
+                  int fs_out_val=g_sample_rate/D_val;
+                  swprintf(bw,16,L"%d",fs_out_val/1000);
+              }
+          } }
+        wchar_t ddc[48]; _snwprintf(ddc,48,L" DDC %skHz/%skHz",cf,bw);
+        wcsncat(parts,ddc,128-wcslen(parts)-1);
+    }
+    wcsncpy(desc,parts,n-1);
+}
+
+/* ------------------------------------------------------------------ */
+/*  Update prediction label                                           */
+/* ------------------------------------------------------------------ */
+static void update_channel_controls(void)
+{
+    wchar_t input[MAX_PATH];
+    GetWindowTextW(GetDlgItem(g_hwnd,ID_INPUT_EDIT),input,MAX_PATH);
+    FileInfo fi; fi.dual=1; /* default: assume dual if unknown */
+    if(input[0]) probe_file(input,&fi);
+    g_sample_rate = fi.sample_rate;
+    BOOL dual = fi.dual;
+    EnableWindow(GetDlgItem(g_hwnd,ID_CHAN_DUAL), dual);
+    EnableWindow(GetDlgItem(g_hwnd,ID_CHAN_CH2),  dual);
+    /* If single-channel, force Tuner A and uncheck Dual/Tuner B */
+    if(!dual){
+        CheckRadioButton(g_hwnd,ID_CHAN_DUAL,ID_CHAN_CH2,ID_CHAN_CH1);
+    }
+}
+
+static void update_run_batch_button(void)
+{
+    if(g_running){ EnableWindow(GetDlgItem(g_hwnd,ID_RUN_BATCH),FALSE); return; }
+    BOOL any_runnable=FALSE;
+    for(int i=0;i<g_job_count;i++){
+        if(wcscmp(g_jobs[i].status,L"Done")!=0)
+            { any_runnable=TRUE; break; }
+    }
+    EnableWindow(GetDlgItem(g_hwnd,ID_RUN_BATCH), any_runnable && g_job_count>0);
+}
+
+
+
+static void update_format_controls(void)
+{
+    /* Grey out format buttons that would produce a same-format no-op.
+     * A format is a no-op if: output fmt == input fmt AND no trim AND
+     * no DDC AND no channel extraction (ch1/ch2 from dual). */
+    wchar_t input[MAX_PATH];
+    GetWindowTextW(GetDlgItem(g_hwnd,ID_INPUT_EDIT),input,MAX_PATH);
+
+    /* Default: all enabled */
+    EnableWindow(GetDlgItem(g_hwnd,ID_FMT_SAME),      TRUE);
+    EnableWindow(GetDlgItem(g_hwnd,ID_FMT_LINRAD),     TRUE);
+    EnableWindow(GetDlgItem(g_hwnd,ID_FMT_WAVVIEWDX),  TRUE);
+    EnableWindow(GetDlgItem(g_hwnd,ID_FMT_SDRUNO),     TRUE);
+    EnableWindow(GetDlgItem(g_hwnd,ID_FMT_SDRCONNECT), TRUE);
+    EnableWindow(GetDlgItem(g_hwnd,ID_FMT_PERSEUS),    TRUE);
+    EnableWindow(GetDlgItem(g_hwnd,ID_FMT_JAGUAR),     TRUE);
+
+    if(!input[0]) return;
+
+    FileInfo fi; fi.fmt=-1; fi.dual=0;
+    probe_file(input,&fi);
+    if(fi.fmt<0) return;
+
+    /* Grey out formats whose hardcoded playback rate doesn't match input.
+     * SDRuno and SDR Connect hardcode 2,000,000 Hz regardless of fmt chunk.
+     * Jaguar hardcodes 1,600,000 Hz. Perseus and Linrad/WavViewDX read fmt chunk. */
+    if(fi.sample_rate > 0 && fi.sample_rate != 2000000){
+        /* Input not at 2MHz — SDRuno and SDR Connect will play at wrong speed/frequency */
+        if(IsDlgButtonChecked(g_hwnd,ID_FMT_SDRUNO)||
+           IsDlgButtonChecked(g_hwnd,ID_FMT_SDRCONNECT))
+            CheckRadioButton(g_hwnd,ID_FMT_SAME,ID_FMT_JAGUAR,ID_FMT_SAME);
+        EnableWindow(GetDlgItem(g_hwnd,ID_FMT_SDRUNO),     FALSE);
+        EnableWindow(GetDlgItem(g_hwnd,ID_FMT_SDRCONNECT), FALSE);
+    }
+    if(fi.sample_rate > 0 && fi.sample_rate != 1999000){
+        /* Input not at 1.999MHz — Perseus format requires exactly this rate */
+        if(IsDlgButtonChecked(g_hwnd,ID_FMT_PERSEUS))
+            CheckRadioButton(g_hwnd,ID_FMT_SAME,ID_FMT_JAGUAR,ID_FMT_SAME);
+        EnableWindow(GetDlgItem(g_hwnd,ID_FMT_PERSEUS), FALSE);
+    }
+    if(fi.sample_rate > 0 && fi.sample_rate != 1600000){
+        /* Input not at 1.6MHz — Jaguar will play at wrong speed/frequency */
+        if(IsDlgButtonChecked(g_hwnd,ID_FMT_JAGUAR))
+            CheckRadioButton(g_hwnd,ID_FMT_SAME,ID_FMT_JAGUAR,ID_FMT_SAME);
+        EnableWindow(GetDlgItem(g_hwnd,ID_FMT_JAGUAR), FALSE);
+    }
+
+    BOOL trimming   = IsDlgButtonChecked(g_hwnd,ID_MODE_TRIM);
+    BOOL ddc        = IsDlgButtonChecked(g_hwnd,ID_DDC_CHECK);
+    /* ch1/ch2 only counts as extraction when input is dual-channel */
+    BOOL ch_extract = fi.dual &&
+                      (IsDlgButtonChecked(g_hwnd,ID_CHAN_CH1) ||
+                       IsDlgButtonChecked(g_hwnd,ID_CHAN_CH2));
+    BOOL dual_out   = fi.dual && !ch_extract;
+
+    /* Perseus<->Jaguar cross-conversion is not supported (SDR Console hardcodes
+     * different sample rates per format making frequency-accurate conversion impossible).
+     * Gray out the cross-format option. */
+    if(fi.fmt==4){  /* Perseus input: disable Jaguar output */
+        if(IsDlgButtonChecked(g_hwnd,ID_FMT_JAGUAR))
+            CheckRadioButton(g_hwnd,ID_FMT_SAME,ID_FMT_JAGUAR,ID_FMT_PERSEUS);
+        EnableWindow(GetDlgItem(g_hwnd,ID_FMT_JAGUAR), FALSE);
+    } else if(fi.fmt==5){  /* Jaguar input: disable Perseus output */
+        if(IsDlgButtonChecked(g_hwnd,ID_FMT_PERSEUS))
+            CheckRadioButton(g_hwnd,ID_FMT_SAME,ID_FMT_JAGUAR,ID_FMT_JAGUAR);
+        EnableWindow(GetDlgItem(g_hwnd,ID_FMT_PERSEUS), FALSE);
+    }
+
+    /* Perseus: DDC not supported (SDR Console hardcodes sample rate,
+     * ignoring nSamplesPerSec in fmt chunk after decimation). */
+    if(fi.fmt==4){
+        if(IsDlgButtonChecked(g_hwnd,ID_DDC_CHECK)){
+            CheckDlgButton(g_hwnd,ID_DDC_CHECK,BST_UNCHECKED);
+            EnableWindow(GetDlgItem(g_hwnd,ID_DDC_CENTRE),FALSE);
+            EnableWindow(GetDlgItem(g_hwnd,ID_DDC_BW),    FALSE);
+        }
+        EnableWindow(GetDlgItem(g_hwnd,ID_DDC_CHECK),FALSE);
+    } else {
+        EnableWindow(GetDlgItem(g_hwnd,ID_DDC_CHECK),TRUE);
+    }
+
+    /* For dual output, sdruno and sdrconnect are never valid (single-tuner only) */
+    if(dual_out){
+        /* Disable WAV formats — they can't hold dual-tuner data */
+        BOOL wav_sel = IsDlgButtonChecked(g_hwnd,ID_FMT_SDRUNO) ||
+                       IsDlgButtonChecked(g_hwnd,ID_FMT_SDRCONNECT) ||
+                       IsDlgButtonChecked(g_hwnd,ID_FMT_PERSEUS) ||
+                       IsDlgButtonChecked(g_hwnd,ID_FMT_JAGUAR);
+        if(wav_sel)
+            CheckRadioButton(g_hwnd,ID_FMT_SAME,ID_FMT_JAGUAR,
+                fi.fmt==0?ID_FMT_LINRAD:ID_FMT_WAVVIEWDX);
+        EnableWindow(GetDlgItem(g_hwnd,ID_FMT_SDRUNO),     FALSE);
+        EnableWindow(GetDlgItem(g_hwnd,ID_FMT_SDRCONNECT), FALSE);
+        EnableWindow(GetDlgItem(g_hwnd,ID_FMT_PERSEUS),    FALSE);
+        EnableWindow(GetDlgItem(g_hwnd,ID_FMT_JAGUAR),     FALSE);
+        /* "Same as input" for dual linrad/wavviewdx is only a no-op if no trim/ddc */
+        if(!trimming && !ddc){
+            int noop_id = (fi.fmt==0)?ID_FMT_LINRAD:
+                          (fi.fmt==1)?ID_FMT_WAVVIEWDX:-1;
+            if(noop_id>=0){
+                if(IsDlgButtonChecked(g_hwnd,ID_FMT_SAME)||
+                   IsDlgButtonChecked(g_hwnd,noop_id)){
+                    int other = (noop_id==ID_FMT_LINRAD)?ID_FMT_WAVVIEWDX:ID_FMT_LINRAD;
+                    CheckRadioButton(g_hwnd,ID_FMT_SAME,ID_FMT_JAGUAR,other);
+                }
+                EnableWindow(GetDlgItem(g_hwnd,noop_id),    FALSE);
+                EnableWindow(GetDlgItem(g_hwnd,ID_FMT_SAME),FALSE);
+            }
+        }
+        return;
+    }
+
+    /* Single output: disable same-format if it would be a no-op */
+    if(trimming || ddc) return;
+
+    /* Ensure something is always selected. If the currently selected button
+     * is now disabled (greyed out by rate rules above), fall back to Same as input. */
+    BOOL any_checked = FALSE;
+    int fmt_ids[]={ID_FMT_SAME,ID_FMT_LINRAD,ID_FMT_WAVVIEWDX,
+                   ID_FMT_SDRUNO,ID_FMT_SDRCONNECT,ID_FMT_PERSEUS,ID_FMT_JAGUAR};
+    for(int i=0;i<7;i++){
+        if(IsDlgButtonChecked(g_hwnd,fmt_ids[i]) &&
+           IsWindowEnabled(GetDlgItem(g_hwnd,fmt_ids[i]))){
+            any_checked=TRUE; break;
+        }
+    }
+    if(!any_checked)
+        CheckRadioButton(g_hwnd,ID_FMT_SAME,ID_FMT_JAGUAR,ID_FMT_SAME);
+}
+
+static void update_prediction(void)
+{
+    wchar_t input[MAX_PATH];
+    GetWindowTextW(GetDlgItem(g_hwnd,ID_INPUT_EDIT),input,MAX_PATH);
+    if(!input[0]){
+        SetWindowTextW(GetDlgItem(g_hwnd,ID_OUTFILE_STATIC),L"Output: (select input file)");
+        return;
+    }
+    wchar_t outfile[MAX_PATH];
+    if(predict_outfile(input,outfile,MAX_PATH)){
+        wchar_t label[MAX_PATH+16];
+        wchar_t *fn=wcsrchr(outfile,L'\\');
+        _snwprintf(label,MAX_PATH+16,L"Output: %s",fn?fn+1:outfile);
+        SetWindowTextW(GetDlgItem(g_hwnd,ID_OUTFILE_STATIC),label);
+    } else {
+        SetWindowTextW(GetDlgItem(g_hwnd,ID_OUTFILE_STATIC),L"Output: (unable to predict)");
+    }
+}
+
+/* ------------------------------------------------------------------ */
+/*  Batch ListView helpers                                            */
+/* ------------------------------------------------------------------ */
+static void batch_list_refresh_row(int idx)
+{
+    HWND hlv=GetDlgItem(g_hwnd,ID_BATCH_LIST);
+    wchar_t num[8]; _snwprintf(num,8,L"%d",idx+1);
+    LVITEMW li; ZeroMemory(&li,sizeof(li));
+    li.mask=LVIF_TEXT; li.iItem=idx;
+    li.iSubItem=COL_NUM;    li.pszText=num;                        ListView_SetItem(hlv,&li);
+    li.iSubItem=COL_INPUT;  li.pszText=g_jobs[idx].input_short;   ListView_SetItem(hlv,&li);
+    li.iSubItem=COL_OP;     li.pszText=g_jobs[idx].op_desc;       ListView_SetItem(hlv,&li);
+    li.iSubItem=COL_OUTPUT; li.pszText=g_jobs[idx].output_short;  ListView_SetItem(hlv,&li);
+    li.iSubItem=COL_STATUS; li.pszText=g_jobs[idx].status;        ListView_SetItem(hlv,&li);
+}
+
+static void batch_list_add_row(int idx)
+{
+    HWND hlv=GetDlgItem(g_hwnd,ID_BATCH_LIST);
+    LVITEMW li; ZeroMemory(&li,sizeof(li));
+    li.mask=LVIF_TEXT; li.iItem=idx; li.iSubItem=0;
+    wchar_t num[8]; _snwprintf(num,8,L"%d",idx+1);
+    li.pszText=num;
+    ListView_InsertItem(hlv,&li);
+    batch_list_refresh_row(idx);
+}
+
+static void batch_list_set_status(int idx,const wchar_t *status)
+{
+    wcsncpy(g_jobs[idx].status,status,31);
+    HWND hlv=GetDlgItem(g_hwnd,ID_BATCH_LIST);
+    LVITEMW li; ZeroMemory(&li,sizeof(li));
+    li.mask=LVIF_TEXT; li.iItem=idx; li.iSubItem=COL_STATUS;
+    li.pszText=(wchar_t*)status;
+    ListView_SetItem(hlv,&li);
+}
+
+/* ------------------------------------------------------------------ */
+/*  Core job runner — runs one sdrtrim process, streams output        */
+/*  Called from both single-run thread and batch thread.              */
+/* ------------------------------------------------------------------ */
+static DWORD run_one_job(const wchar_t *cmdline)
+{
+    /* Parse cmdline into argv[] and call sdr_process_args() directly */
+    /* Format: "path\\sdrtrim.exe" "infile" [options...] */
+    /* Skip argv[0] (exe path) — sdr_process_args expects argv[1]=infile */
+    wchar_t tmp[4096];
+    wcsncpy(tmp, cmdline, 4095); tmp[4095]=L'\0';
+
+    /* Tokenise respecting quoted strings */
+    char *argv_buf[64];
+    int argc = 0;
+    static char arg_store[64][512];
+    wchar_t *p = tmp;
+    while(*p && argc < 63){
+        while(*p==L' ') p++;
+        if(!*p) break;
+        wchar_t *start;
+        int quoted = (*p==L'"');
+        if(quoted){ p++; start=p; while(*p&&*p!=L'"') p++; }
+        else       { start=p;    while(*p&&*p!=L' ') p++; }
+        int len=(int)(p-start);
+        WideCharToMultiByte(CP_UTF8,0,start,len,arg_store[argc],511,NULL,NULL);
+        arg_store[argc][len]='\0';
+        argv_buf[argc]=arg_store[argc];
+        argc++;
+        if(quoted&&*p==L'"') p++;
+    }
+    argv_buf[argc]=NULL;
+
+    if(argc < 2) return 1;  /* need at least exe + infile */
+
+    g_proc_hwnd = g_hwnd;
+    int rc = sdr_process_args(argc, argv_buf);
+    return (DWORD)rc;
+}
+
+/* ------------------------------------------------------------------ */
+/*  Single-job worker thread                                          */
+/* ------------------------------------------------------------------ */
+typedef struct { wchar_t cmdline[4096]; } ThreadArgs;
+
+static DWORD WINAPI run_thread(LPVOID param)
+{
+    ThreadArgs *args=(ThreadArgs*)param;
+    DWORD ec=run_one_job(args->cmdline);
+    wchar_t done[128];
+    if(ec==(DWORD)-1)
+        _snwprintf(done,128,L"Processing failed.\r\n");
+    else if(ec==0)
+        _snwprintf(done,128,L"Completed successfully.\r\n");
+    else
+        _snwprintf(done,128,L"Failed (exit code %lu).\r\n",ec);
+    PostMessageW(g_hwnd,WM_APPENDLOG,0,(LPARAM)_wcsdup(done));
+    PostMessageW(g_hwnd,WM_APPENDLOG,1,(LPARAM)(ULONG_PTR)ec);
+    free(args); return 0;
+}
+
+/* ------------------------------------------------------------------ */
+/*  Batch worker thread                                               */
+/* ------------------------------------------------------------------ */
+static DWORD WINAPI batch_thread(LPVOID param)
+{
+    (void)param;
+    for(int i=0;i<g_job_count;i++){
+        /* Skip if already cancelled */
+        if(wcscmp(g_jobs[i].status,L"Cancelled")==0) continue;
+
+        /* Mark running */
+        PostMessageW(g_hwnd,WM_BATCHSTATUS,(WPARAM)i,(LPARAM)_wcsdup(L"Running"));
+
+        /* Log header */
+        wchar_t hdr[4200];
+        _snwprintf(hdr,4200,L"--- Job %d of %d: %s ---\r\n> %s\r\n",
+            i+1,g_job_count,g_jobs[i].input_short,g_jobs[i].cmdline);
+        PostMessageW(g_hwnd,WM_APPENDLOG,0,(LPARAM)_wcsdup(hdr));
+
+        /* Reset progress */
+        PostMessageW(g_hwnd,WM_UPDATEPROG,0,0);
+
+        DWORD ec=run_one_job(g_jobs[i].cmdline);
+
+        /* If cancelled mid-job g_hprocess was terminated, ec will be non-zero */
+        if(ec==(DWORD)-1 || ec!=0){
+            /* Check if user cancelled — g_hprocess cleared on termination */
+            const wchar_t *st=L"Failed";
+            /* If the batch itself was cancelled, mark remaining jobs */
+            if(!g_batch_run){
+                PostMessageW(g_hwnd,WM_BATCHSTATUS,(WPARAM)i,(LPARAM)_wcsdup(L"Cancelled"));
+                /* Cancel pending jobs */
+                for(int j=i+1;j<g_job_count;j++)
+                    if(wcscmp(g_jobs[j].status,L"Pending")==0)
+                        PostMessageW(g_hwnd,WM_BATCHSTATUS,(WPARAM)j,(LPARAM)_wcsdup(L"Cancelled"));
+                break;
+            }
+            PostMessageW(g_hwnd,WM_BATCHSTATUS,(WPARAM)i,(LPARAM)_wcsdup(st));
+        } else {
+            PostMessageW(g_hwnd,WM_BATCHSTATUS,(WPARAM)i,(LPARAM)_wcsdup(L"Done"));
+        }
+
+        wchar_t done[64];
+        _snwprintf(done,64,L"Job %d %s.\r\n\r\n",i+1,ec==0?L"completed":L"failed");
+        PostMessageW(g_hwnd,WM_APPENDLOG,0,(LPARAM)_wcsdup(done));
+    }
+    PostMessageW(g_hwnd,WM_BATCHDONE,0,0);
+    return 0;
+}
+
+/* ------------------------------------------------------------------ */
+/*  Segmented progress bar — owner-draw                               */
+/* ------------------------------------------------------------------ */
+static void draw_progress_bar(DRAWITEMSTRUCT *di)
+{
+    RECT r = di->rcItem;
+    int w = r.right - r.left;
+    int h = r.bottom - r.top;
+
+    /* Draw to a memory DC to avoid flicker */
+    HDC mdc = CreateCompatibleDC(di->hDC);
+    HBITMAP bmp = CreateCompatibleBitmap(di->hDC, w, h);
+    HBITMAP old_bmp = (HBITMAP)SelectObject(mdc, bmp);
+
+    RECT mr = {0, 0, w, h};
+
+    HBRUSH hbg = CreateSolidBrush(RGB(255,255,255));
+    FillRect(mdc, &mr, hbg);
+    DeleteObject(hbg);
+
+    int seg_w=8, gap=2, pitch=seg_w+gap;
+    int n_segs=(w+gap)/pitch;
+    int filled=(g_progress*n_segs+50)/100;
+    for(int i=0;i<n_segs;i++){
+        int x=i*pitch;
+        RECT sr={x, 1, x+seg_w, h-1};
+        HBRUSH hb=CreateSolidBrush(i<filled?CLR_SEG_ON:CLR_SEG_OFF);
+        FillRect(mdc,&sr,hb);
+        DeleteObject(hb);
+    }
+
+    /* Blit to screen in one shot */
+    BitBlt(di->hDC, r.left, r.top, w, h, mdc, 0, 0, SRCCOPY);
+
+    SelectObject(mdc, old_bmp);
+    DeleteObject(bmp);
+    DeleteDC(mdc);
+}
+
+/* ------------------------------------------------------------------ */
+/*  Coloured Run button — owner-draw                                  */
+/* ------------------------------------------------------------------ */
+static void draw_run_button(DRAWITEMSTRUCT *di)
+{
+    BOOL pressed=(di->itemState&ODS_SELECTED)!=0;
+    COLORREF bg=pressed?CLR_RUN_HOT:CLR_RUN_BG;
+    HBRUSH hbr=CreateSolidBrush(bg);
+    FillRect(di->hDC,&di->rcItem,hbr); DeleteObject(hbr);
+    HPEN hp=CreatePen(PS_SOLID,1,RGB(0,84,153));
+    HPEN op=(HPEN)SelectObject(di->hDC,hp);
+    HBRUSH ob=(HBRUSH)SelectObject(di->hDC,GetStockObject(NULL_BRUSH));
+    RECT r=di->rcItem; r.right--; r.bottom--;
+    Rectangle(di->hDC,r.left,r.top,r.right,r.bottom);
+    SelectObject(di->hDC,op); SelectObject(di->hDC,ob); DeleteObject(hp);
+    SetBkMode(di->hDC,TRANSPARENT);
+    SetTextColor(di->hDC,CLR_RUN_TEXT);
+    if(g_font_bold) SelectObject(di->hDC,g_font_bold);
+    DrawTextW(di->hDC,L"Run",-1,&di->rcItem,DT_CENTER|DT_VCENTER|DT_SINGLELINE);
+    if(di->itemState&ODS_FOCUS){ RECT fr=di->rcItem; InflateRect(&fr,-3,-3); DrawFocusRect(di->hDC,&fr); }
+}
+
+/* ------------------------------------------------------------------ */
+/*  Layout helpers                                                     */
+/* ------------------------------------------------------------------ */
+#define FH (-15)
+
+static HWND mk_static(HWND p,const wchar_t *t,int x,int y,int w,int h)
+{ HWND hw=CreateWindowExW(0,L"STATIC",t,WS_CHILD|WS_VISIBLE|SS_LEFT,x,y,w,h,p,NULL,g_hinst,NULL);
+  SendMessageW(hw,WM_SETFONT,(WPARAM)g_font,FALSE); return hw; }
+
+static HWND mk_edit(HWND p,int id,int x,int y,int w,int h,BOOL multi,BOOL ro)
+{ DWORD s=WS_CHILD|WS_VISIBLE|WS_TABSTOP|ES_AUTOHSCROLL;
+  if(multi) s|=ES_MULTILINE|ES_AUTOVSCROLL|WS_VSCROLL|ES_READONLY|ES_NOHIDESEL;
+  if(ro) s|=ES_READONLY;
+  HWND hw=CreateWindowExW(WS_EX_CLIENTEDGE,L"EDIT",L"",s,x,y,w,h,p,(HMENU)(INT_PTR)id,g_hinst,NULL);
+  SendMessageW(hw,WM_SETFONT,(WPARAM)(multi?g_font_mono:g_font),FALSE); return hw; }
+
+static HWND mk_btn(HWND p,int id,const wchar_t *t,int x,int y,int w,int h,DWORD extra)
+{ HWND hw=CreateWindowExW(0,L"BUTTON",t,WS_CHILD|WS_VISIBLE|WS_TABSTOP|extra,
+    x,y,w,h,p,(HMENU)(INT_PTR)id,g_hinst,NULL);
+  SendMessageW(hw,WM_SETFONT,(WPARAM)g_font,FALSE); return hw; }
+
+static HWND mk_radio(HWND p,int id,const wchar_t *t,int x,int y,int w,int h,BOOL first)
+{ DWORD s=WS_CHILD|WS_VISIBLE|WS_TABSTOP|BS_AUTORADIOBUTTON|(first?WS_GROUP:0);
+  HWND hw=CreateWindowExW(0,L"BUTTON",t,s,x,y,w,h,p,(HMENU)(INT_PTR)id,g_hinst,NULL);
+  SendMessageW(hw,WM_SETFONT,(WPARAM)g_font,FALSE); return hw; }
+
+static HWND mk_check(HWND p,int id,const wchar_t *t,int x,int y,int w,int h)
+{ HWND hw=CreateWindowExW(0,L"BUTTON",t,WS_CHILD|WS_VISIBLE|WS_TABSTOP|BS_AUTOCHECKBOX|WS_GROUP,
+    x,y,w,h,p,(HMENU)(INT_PTR)id,g_hinst,NULL);
+  SendMessageW(hw,WM_SETFONT,(WPARAM)g_font,FALSE); return hw; }
+
+static HWND mk_group(HWND p,const wchar_t *t,int x,int y,int w,int h)
+{ HWND hw=CreateWindowExW(0,L"BUTTON",t,WS_CHILD|WS_VISIBLE|BS_GROUPBOX,
+    x,y,w,h,p,NULL,g_hinst,NULL);
+  SendMessageW(hw,WM_SETFONT,(WPARAM)g_font,FALSE); return hw; }
+
+/* ------------------------------------------------------------------ */
+/*  Create all controls                                               */
+/* ------------------------------------------------------------------ */
+/* Populate the DDC bandwidth combobox based on input file sample rate.
+ * Shows only rates where fs_in % D == 0 AND fs_out >= 50000 AND fs_out % 100 == 0.
+ * Stores D as item data so run_job can recover it without string parsing. */
+static void populate_bw_dropdown(HWND hwnd, int fs_in)
+{
+    HWND hcb = GetDlgItem(hwnd, ID_DDC_BW);
+    SendMessageW(hcb, CB_RESETCONTENT, 0, 0);
+    if(fs_in <= 0) return;
+
+    /* Try to restore previous selection */
+    wchar_t prev[32]={0};
+    ini_rs(L"S",L"DDCbw",L"",prev,32);
+    int prev_sel = -1, added = 0;
+
+    for(int D = 2; D <= fs_in/50000; D++){
+        if(fs_in % D != 0) continue;
+        int fs_out = fs_in / D;
+        if(fs_out < 50000) break;
+        if(fs_out % 100 != 0) continue;  /* skip non-round rates */
+
+        wchar_t label[32];
+        if(fs_out % 1000 == 0)
+            swprintf(label, 32, L"%d kHz", fs_out/1000);
+        else
+            swprintf(label, 32, L"%.1f kHz", (double)fs_out/1000.0);
+
+        int idx = (int)SendMessageW(hcb, CB_ADDSTRING, 0, (LPARAM)label);
+        SendMessageW(hcb, CB_SETITEMDATA, (WPARAM)idx, (LPARAM)D);
+        if(prev[0] && wcscmp(label, prev)==0) prev_sel = idx;
+        added++;
+    }
+    if(added > 0)
+        SendMessageW(hcb, CB_SETCURSEL, (WPARAM)(prev_sel>=0 ? prev_sel : 0), 0);
+}
+
+static void create_controls(HWND hwnd)
+{
+    g_font      =CreateFontW(FH,0,0,0,FW_NORMAL,0,0,0,DEFAULT_CHARSET,0,0,CLEARTYPE_QUALITY,DEFAULT_PITCH,L"Segoe UI");
+    g_font_bold =CreateFontW(FH,0,0,0,FW_SEMIBOLD,0,0,0,DEFAULT_CHARSET,0,0,CLEARTYPE_QUALITY,DEFAULT_PITCH,L"Segoe UI");
+    g_font_mono =CreateFontW(FH,0,0,0,FW_NORMAL,0,0,0,DEFAULT_CHARSET,0,0,CLEARTYPE_QUALITY,FIXED_PITCH,L"Consolas");
+    g_font_title=CreateFontW(-20,0,0,0,FW_LIGHT,0,0,0,DEFAULT_CHARSET,0,0,CLEARTYPE_QUALITY,DEFAULT_PITCH,L"Segoe UI");
+
+    RECT cr; GetClientRect(hwnd,&cr);
+    int W=cr.right, H=cr.bottom;
+    int M=12, y=g_header_h+14;
+
+    /* ── Input ── */
+    mk_group(hwnd,L"Input File",M,y,W-M*2,54);
+    mk_edit(hwnd,ID_INPUT_EDIT,M+10,y+22,W-M*2-86,24,FALSE,FALSE);
+    mk_btn(hwnd,ID_BROWSE,L"Browse...",W-M-74,y+22,72,24,BS_PUSHBUTTON);
+    y+=63;
+
+    /* ── Mode ── */
+    mk_group(hwnd,L"Mode",M,y,W-M*2,54);
+    mk_radio(hwnd,ID_MODE_FULL,L"Full file",M+10, y+26,84,20,TRUE);
+    mk_radio(hwnd,ID_MODE_TRIM,L"Trim",     M+102,y+26,58,20,FALSE);
+    mk_static(hwnd,L"Start:",M+170,y+28,42,16);
+    mk_edit(hwnd,ID_START_EDIT,M+214,y+24,68,24,FALSE,FALSE);
+    mk_static(hwnd,L"End:",M+290,y+28,34,16);
+    mk_edit(hwnd,ID_END_EDIT,M+328,y+24,68,24,FALSE,FALSE);
+    mk_static(hwnd,L"HHMMSS",M+400,y+28,80,16);
+    y+=63;
+
+    /* ── Channel ── */
+    mk_group(hwnd,L"Channel",M,y,W-M*2,50);
+    mk_radio(hwnd,ID_CHAN_DUAL,L"Dual (both tuners)",M+10, y+26,148,20,TRUE);
+    mk_radio(hwnd,ID_CHAN_CH1, L"Tuner A  (--ch1)",  M+174,y+26,130,20,FALSE);
+    mk_radio(hwnd,ID_CHAN_CH2, L"Tuner B  (--ch2)",  M+318,y+26,130,20,FALSE);
+    y+=59;
+
+    /* ── DDC ── */
+    mk_group(hwnd,L"DDC  (Digital Down-Conversion)",M,y,W-M*2,54);
+    mk_check(hwnd,ID_DDC_CHECK,L"Enable",M+10,y+26,72,20);
+    mk_static(hwnd,L"Centre:",M+92, y+28,52,16);
+    mk_edit(hwnd,ID_DDC_CENTRE,M+146,y+24,68,24,FALSE,FALSE);
+    mk_static(hwnd,L"kHz",M+218,y+28,30,16);
+    mk_static(hwnd,L"Bandwidth:",M+258,y+28,76,16);
+    { HWND hbw=CreateWindowExW(0,L"COMBOBOX",NULL,
+        WS_CHILD|WS_VISIBLE|CBS_DROPDOWNLIST|WS_VSCROLL,
+        M+336,y+24,120,200,hwnd,(HMENU)(UINT_PTR)ID_DDC_BW,
+        (HINSTANCE)GetWindowLongPtrW(hwnd,GWLP_HINSTANCE),NULL);
+      SetWindowPos(hbw,HWND_TOP,0,0,0,0,SWP_NOMOVE|SWP_NOSIZE); }
+    y+=63;
+    mk_group(hwnd,L"Output Format",M,y,W-M*2,50);
+    mk_radio(hwnd,ID_FMT_SAME,      L"Same as input", M+8,  y+26,120,20,TRUE);
+    mk_radio(hwnd,ID_FMT_LINRAD,    L"Linrad",         M+138,y+26, 62,20,FALSE);
+    mk_radio(hwnd,ID_FMT_WAVVIEWDX, L"WavViewDX",      M+208,y+26, 96,20,FALSE);
+    mk_radio(hwnd,ID_FMT_SDRUNO,    L"SDRuno",         M+312,y+26, 70,20,FALSE);
+    mk_radio(hwnd,ID_FMT_SDRCONNECT,L"SDR Connect",    M+390,y+26,106,20,FALSE);
+    mk_radio(hwnd,ID_FMT_PERSEUS,   L"Perseus",        M+504,y+26, 74,20,FALSE);
+    mk_radio(hwnd,ID_FMT_JAGUAR,    L"Jaguar",         M+586,y+26, 68,20,FALSE);
+    y+=59;
+
+    /* ── Predicted output label ── */
+    HWND hpred=mk_static(hwnd,L"Output: (select input file)",M+2,y,W-M*2-4,18);
+    SetWindowLongW(hpred,GWLP_ID,ID_OUTFILE_STATIC);
+    y+=26;
+
+    /* ── Log ── */
+    int log_h=120;
+    { HWND hg=mk_group(hwnd,L"Output Log",M,y,W-M*2,log_h+22);
+      SetWindowLongW(hg,GWLP_ID,ID_LOG_GROUP); }
+    mk_edit(hwnd,ID_LOG_EDIT,M+8,y+20,W-M*2-16,log_h,TRUE,TRUE);
+    y+=log_h+30;
+
+    /* ── Progress bar row ── */
+    int prog_h=18, lbl_h=18;
+    int lbl_y=y+(prog_h-lbl_h)/2;
+    HWND hpct=CreateWindowExW(0,L"STATIC",L"",WS_CHILD|WS_VISIBLE|SS_RIGHT,
+        M,lbl_y,36,lbl_h,hwnd,(HMENU)(INT_PTR)ID_PCT_STATIC,g_hinst,NULL);
+    SendMessageW(hpct,WM_SETFONT,(WPARAM)g_font,FALSE);
+    HWND heta=CreateWindowExW(0,L"STATIC",L"",WS_CHILD|WS_VISIBLE|SS_LEFT,
+        W-M-90,lbl_y,90,lbl_h,hwnd,(HMENU)(INT_PTR)ID_ETA_STATIC,g_hinst,NULL);
+    SendMessageW(heta,WM_SETFONT,(WPARAM)g_font,FALSE);
+    int bar_x=M+40, bar_w=W-M-94-bar_x;
+    CreateWindowExW(WS_EX_CLIENTEDGE,L"STATIC",L"",WS_CHILD|WS_VISIBLE|SS_OWNERDRAW,
+        bar_x,y,bar_w,prog_h,hwnd,(HMENU)(INT_PTR)ID_PROGRESS,g_hinst,NULL);
+    y+=prog_h+8;
+
+    /* ── Buttons row ── */
+    mk_btn(hwnd,ID_RUN,    L"Run",       W-M-256,y,78,28,BS_OWNERDRAW);
+    mk_btn(hwnd,ID_CANCEL, L"Cancel",    W-M-170,y,78,28,BS_PUSHBUTTON);
+    mk_btn(hwnd,ID_CLEAR,  L"Clear Log", W-M-84, y,78,28,BS_PUSHBUTTON);
+    y+=38;
+
+    /* ── Batch section ── */
+    /* Separator label */
+    mk_static(hwnd,L"Batch Jobs",M,y+4,90,18);
+    mk_btn(hwnd,ID_ADD_BATCH,  L"Add to Batch",W-M-280,y,96,26,BS_PUSHBUTTON);
+    mk_btn(hwnd,ID_RUN_BATCH,  L"Run Batch",   W-M-176,y,86,26,BS_PUSHBUTTON);
+    mk_btn(hwnd,ID_CLEAR_BATCH,L"Clear All",   W-M-82, y,70,26,BS_PUSHBUTTON);
+    y+=34;
+
+    /* ── Batch ListView ── */
+    int lv_h=H-M-y;
+    if(lv_h<80) lv_h=80;
+    HWND hlv=CreateWindowExW(WS_EX_CLIENTEDGE,WC_LISTVIEWW,L"",
+        WS_CHILD|WS_VISIBLE|WS_TABSTOP|
+        LVS_REPORT|LVS_SINGLESEL|LVS_SHOWSELALWAYS|LVS_NOSORTHEADER,
+        M,y,W-M*2,lv_h,
+        hwnd,(HMENU)(INT_PTR)ID_BATCH_LIST,g_hinst,NULL);
+    SendMessageW(hlv,WM_SETFONT,(WPARAM)g_font,FALSE);
+    ListView_SetExtendedListViewStyle(hlv,LVS_EX_FULLROWSELECT|LVS_EX_GRIDLINES);
+
+    /* Columns */
+    LVCOLUMNW lc; ZeroMemory(&lc,sizeof(lc)); lc.mask=LVCF_TEXT|LVCF_WIDTH|LVCF_SUBITEM;
+    /* Default column widths — overridden by saved values below */
+    int def_cw[]={30,140,170,140,80};
+    /* Load saved widths from INI if available */
+    wchar_t ini_pth[MAX_PATH]; ini_path(ini_pth,MAX_PATH);
+    for(int col=0;col<5;col++){
+        wchar_t key[16]; _snwprintf(key,16,L"col%d",col);
+        int saved=(int)GetPrivateProfileIntW(L"Cols",key,-1,ini_pth);
+        if(saved>10) def_cw[col]=saved;
+    }
+    const wchar_t *col_names[]={L"#",L"Input",L"Operation",L"Output",L"Status"};
+    int col_ids[]={COL_NUM,COL_INPUT,COL_OP,COL_OUTPUT,COL_STATUS};
+    for(int col=0;col<5;col++){
+        lc.cx=def_cw[col]; lc.pszText=(wchar_t*)col_names[col];
+        lc.iSubItem=col_ids[col];
+        ListView_InsertColumn(hlv,col_ids[col],&lc);
+    }
+
+    /* ── Initial state ── */
+    CheckRadioButton(hwnd,ID_MODE_FULL,ID_MODE_TRIM,ID_MODE_FULL);
+    EnableWindow(GetDlgItem(hwnd,ID_START_EDIT),FALSE);
+    EnableWindow(GetDlgItem(hwnd,ID_END_EDIT),  FALSE);
+    CheckRadioButton(hwnd,ID_CHAN_DUAL,ID_CHAN_CH2,ID_CHAN_DUAL);
+    CheckRadioButton(hwnd,ID_FMT_SAME,ID_FMT_JAGUAR,ID_FMT_SAME);
+    EnableWindow(GetDlgItem(hwnd,ID_DDC_CENTRE),FALSE);
+    EnableWindow(GetDlgItem(hwnd,ID_DDC_BW),    FALSE);
+    EnableWindow(GetDlgItem(hwnd,ID_CANCEL),    FALSE);
+
+    /* Header panel — created LAST so it has highest z-order */
+    CreateWindowExW(0,L"BUTTON",L"",WS_CHILD|WS_VISIBLE|BS_OWNERDRAW,
+        0,0,W,g_header_h,hwnd,(HMENU)(INT_PTR)ID_HEADER_PANEL,g_hinst,NULL);
+}
+
+/* ------------------------------------------------------------------ */
+/*  Browse for input file                                             */
+/* ------------------------------------------------------------------ */
+static void browse_file(void)
+{
+    wchar_t buf[MAX_PATH]={0};
+    OPENFILENAMEW ofn; ZeroMemory(&ofn,sizeof(ofn));
+    ofn.lStructSize=sizeof(ofn); ofn.hwndOwner=g_hwnd;
+    ofn.lpstrFilter=L"IQ Recordings\0*.raw;*.wav\0All Files\0*.*\0";
+    ofn.lpstrFile=buf; ofn.nMaxFile=MAX_PATH;
+    ofn.Flags=OFN_FILEMUSTEXIST|OFN_PATHMUSTEXIST;
+    ofn.lpstrTitle=L"Select Input Recording";
+    if(GetOpenFileNameW(&ofn)){
+        SetWindowTextW(GetDlgItem(g_hwnd,ID_INPUT_EDIT),buf);
+        update_channel_controls();
+        update_format_controls();
+        update_prediction();
+    }
+}
+
+/* ------------------------------------------------------------------ */
+/*  Window procedure                                                  */
+/* ------------------------------------------------------------------ */
+static LRESULT CALLBACK wnd_proc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp)
+{
+    switch(msg){
+
+    case WM_CREATE:
+        g_hwnd=hwnd;
+        g_hbr_bg    =CreateSolidBrush(CLR_BG);
+        g_hbr_header=CreateSolidBrush(CLR_HEADER_BG);
+        return 0;
+
+
+    case WM_GETMINMAXINFO:{
+        MINMAXINFO *mm=(MINMAXINFO*)lp;
+        mm->ptMinTrackSize.x=800;
+        mm->ptMinTrackSize.y=700;
+        return 0;}
+
+    case WM_SIZE:{
+        static BOOL done=FALSE;
+        if(!done){
+            done=TRUE;
+            create_controls(hwnd);
+            restore_settings();
+            update_prediction();
+            return 0;
+        }
+        /* Resize: reposition/resize stretchy controls */
+        if(wp==SIZE_MINIMIZED) return 0;
+        int W=LOWORD(lp), H=HIWORD(lp);
+        int M=12;
+        HDWP hdwp=BeginDeferWindowPos(16);
+        #define MV(id,x,y,w,h) \
+            hdwp=DeferWindowPos(hdwp,GetDlgItem(hwnd,id),NULL,x,y,w,h, \
+                SWP_NOZORDER|SWP_NOACTIVATE);
+
+        /* Input edit stretches, Browse stays right */
+        MV(ID_INPUT_EDIT, M+10,     g_header_h+14+22,  W-M*2-86,  24)
+        MV(ID_BROWSE,     W-M-74,   g_header_h+14+22,  72,        24)
+
+        /* Prediction label stretches */
+        MV(ID_OUTFILE_STATIC, M+2,  373,  W-M*2-4, 18)
+
+        /* Log group + edit stretch */
+        int log_top = 399;
+        int log_group_h = 120;
+        MV(ID_LOG_EDIT,   M+8,      log_top+20, W-M*2-16, log_group_h)
+        MV(ID_LOG_GROUP,  M,        log_top,    W-M*2,    log_group_h+22)
+
+        /* Progress bar stretches */
+        int prog_y=log_top+log_group_h+30;
+        int bar_x=M+40, bar_w=W-M-94-bar_x;
+        MV(ID_PROGRESS,  bar_x, prog_y,       bar_w, 18)
+        MV(ID_ETA_STATIC,W-M-90,prog_y,       90,    18)
+
+        /* Buttons move right */
+        int btn_y=prog_y+26;
+        MV(ID_RUN,    W-M-256, btn_y, 78, 28)
+        MV(ID_CANCEL, W-M-170, btn_y, 78, 28)
+        MV(ID_CLEAR,  W-M-84,  btn_y, 78, 28)
+
+        /* Batch toolbar buttons move right */
+        int batch_hdr_y=btn_y+38;
+        MV(ID_ADD_BATCH,   W-M-274, batch_hdr_y, 90, 26)
+        MV(ID_RUN_BATCH,   W-M-176, batch_hdr_y, 86, 26)
+        MV(ID_CLEAR_BATCH, W-M-82,  batch_hdr_y, 70, 26)
+
+        /* Batch list stretches both ways */
+        int lv_y=batch_hdr_y+34;
+        int lv_h=H-M-lv_y;
+        if(lv_h<80) lv_h=80;
+        MV(ID_BATCH_LIST, M, lv_y, W-M*2, lv_h)
+
+        /* Header panel stretches */
+        MV(ID_HEADER_PANEL, 0, 0, W, g_header_h)
+
+        #undef MV
+        EndDeferWindowPos(hdwp);
+        return 0;}
+
+    case WM_ERASEBKGND:{
+        HDC dc=(HDC)wp; RECT r; GetClientRect(hwnd,&r);
+        FillRect(dc,&r,g_hbr_bg);
+        return 1;}
+
+    case WM_CTLCOLOREDIT:
+        SetBkColor((HDC)wp,RGB(255,255,255));
+        return (LRESULT)GetStockObject(WHITE_BRUSH);
+
+    case WM_CTLCOLORSTATIC:{
+        wchar_t cls[16]; GetClassNameW((HWND)lp,cls,16);
+        if(_wcsicmp(cls,L"EDIT")==0){
+            SetBkColor((HDC)wp,RGB(240,240,240));
+            return (LRESULT)GetStockObject(LTGRAY_BRUSH);
+        }
+        SetBkColor((HDC)wp,CLR_BG);
+        return (LRESULT)g_hbr_bg;}
+
+    case WM_CTLCOLORBTN:
+        if((HWND)lp==GetDlgItem(hwnd,ID_RUN)) return (LRESULT)NULL;
+        SetBkColor((HDC)wp,CLR_BG);
+        return (LRESULT)g_hbr_bg;
+
+    case WM_DRAWITEM:{
+        DRAWITEMSTRUCT *di=(DRAWITEMSTRUCT*)lp;
+        if(di->CtlID==ID_RUN)     { draw_run_button(di);   return TRUE; }
+        if(di->CtlID==ID_PROGRESS){ draw_progress_bar(di); return TRUE; }
+        if(di->CtlID==ID_HEADER_PANEL){
+            FillRect(di->hDC,&di->rcItem,g_hbr_header);
+            SetBkMode(di->hDC,TRANSPARENT);
+            SetTextColor(di->hDC,CLR_HEADER_TEXT);
+            if(g_font_title) SelectObject(di->hDC,g_font_title);
+            RECT tr=di->rcItem; tr.left+=14;
+            DrawTextW(di->hDC,L"SDR Trim  v1.5",-1,&tr,DT_LEFT|DT_VCENTER|DT_SINGLELINE);
+            /* Name on right — use normal font, slightly smaller */
+            if(g_font) SelectObject(di->hDC,g_font);
+            RECT nr=di->rcItem; nr.right-=14;
+            DrawTextW(di->hDC,L"github.com/45south",-1,&nr,DT_RIGHT|DT_VCENTER|DT_SINGLELINE);
+            return TRUE;
+        }
+        break;}
+
+    case WM_COMMAND:
+        switch(LOWORD(wp)){
+        case ID_BROWSE: browse_file(); break;
+        case ID_MODE_FULL:
+            EnableWindow(GetDlgItem(hwnd,ID_START_EDIT),FALSE);
+            EnableWindow(GetDlgItem(hwnd,ID_END_EDIT),  FALSE);
+            update_format_controls(); update_prediction(); break;
+        case ID_MODE_TRIM:
+            EnableWindow(GetDlgItem(hwnd,ID_START_EDIT),TRUE);
+            EnableWindow(GetDlgItem(hwnd,ID_END_EDIT),  TRUE);
+            SetFocus(GetDlgItem(hwnd,ID_START_EDIT));
+            update_format_controls(); update_prediction(); break;
+        case ID_CHAN_DUAL: case ID_CHAN_CH1: case ID_CHAN_CH2:
+            update_channel_controls(); update_format_controls(); update_prediction(); break;
+        case ID_FMT_SAME: case ID_FMT_LINRAD: case ID_FMT_WAVVIEWDX:
+        case ID_FMT_SDRUNO: case ID_FMT_SDRCONNECT:
+        case ID_FMT_PERSEUS: case ID_FMT_JAGUAR:
+            /* Manually enforce mutual exclusion across full format group */
+            { int fmts[]={ID_FMT_SAME,ID_FMT_LINRAD,ID_FMT_WAVVIEWDX,
+                           ID_FMT_SDRUNO,ID_FMT_SDRCONNECT,ID_FMT_PERSEUS,ID_FMT_JAGUAR};
+              for(int fi=0;fi<7;fi++)
+                  SendDlgItemMessageW(hwnd,fmts[fi],BM_SETCHECK,
+                      fmts[fi]==LOWORD(wp)?BST_CHECKED:BST_UNCHECKED,0);
+            }
+            update_format_controls(); update_prediction(); break;
+        case ID_DDC_CHECK:{
+            BOOL en=IsDlgButtonChecked(hwnd,ID_DDC_CHECK);
+            EnableWindow(GetDlgItem(hwnd,ID_DDC_CENTRE),en);
+            EnableWindow(GetDlgItem(hwnd,ID_DDC_BW),    en);
+        if(en) populate_bw_dropdown(hwnd, g_sample_rate);
+            update_format_controls(); update_prediction(); break;}
+        case ID_DDC_CENTRE:
+        case ID_START_EDIT: case ID_END_EDIT: case ID_INPUT_EDIT:
+            if(HIWORD(wp)==EN_CHANGE){ update_channel_controls(); update_format_controls(); populate_bw_dropdown(hwnd,g_sample_rate); update_prediction(); } break;
+
+        case ID_RUN:
+            if(g_running) break;
+            {
+                wchar_t input[MAX_PATH];
+                GetWindowTextW(GetDlgItem(hwnd,ID_INPUT_EDIT),input,MAX_PATH);
+                wchar_t outfile[MAX_PATH]={0};
+                if(predict_outfile(input,outfile,MAX_PATH)){
+                    if(GetFileAttributesW(outfile)!=INVALID_FILE_ATTRIBUTES){
+                        wchar_t msg[MAX_PATH+80];
+                        wchar_t *fn=wcsrchr(outfile,L'\\');
+                        _snwprintf(msg,MAX_PATH+80,L"Output file already exists:\n\n%s\n\nOverwrite?",fn?fn+1:outfile);
+                        if(MessageBoxW(hwnd,msg,L"SDR Trim - Overwrite?",
+                                MB_YESNO|MB_ICONWARNING|MB_DEFBUTTON2)!=IDYES) break;
+                    }
+                }
+                ThreadArgs *args=(ThreadArgs*)malloc(sizeof(ThreadArgs));
+                if(!args) break;
+                if(!build_cmdline(args->cmdline,4096)){ free(args); break; }
+                save_settings();
+                log_clear();
+                SendDlgItemMessageW(hwnd,ID_PROGRESS,0,0,0); /* trigger redraw at 0 */
+                g_progress=0; InvalidateRect(GetDlgItem(hwnd,ID_PROGRESS),NULL,FALSE);
+                wchar_t hdr[4096+32]; _snwprintf(hdr,4096+32,L"> %s\r\n\r\n",args->cmdline);
+                log_append(hdr);
+                g_running=TRUE;
+                g_batch_run=FALSE;
+                EnableWindow(GetDlgItem(hwnd,ID_RUN),FALSE);
+                EnableWindow(GetDlgItem(hwnd,ID_CANCEL),TRUE);
+                SetWindowTextW(GetDlgItem(hwnd,ID_PCT_STATIC),L"");
+                SetWindowTextW(GetDlgItem(hwnd,ID_ETA_STATIC),L"");
+                g_thread=CreateThread(NULL,0,run_thread,args,0,NULL);
+                if(!g_thread){
+                    g_running=FALSE;
+                    EnableWindow(GetDlgItem(hwnd,ID_RUN),TRUE);
+                    EnableWindow(GetDlgItem(hwnd,ID_CANCEL),FALSE);
+                    free(args);
+                }
+            }
+            break;
+
+        case ID_CANCEL:
+            if(g_running&&g_hprocess){
+                g_batch_run=FALSE;  /* signal batch to stop */
+                TerminateProcess(g_hprocess,1);
+                log_append(L"Cancelled by user.\r\n");
+            }
+            break;
+
+        case ID_CLEAR: log_clear(); break;
+
+        case ID_ADD_BATCH:
+            if(g_job_count>=MAX_JOBS){
+                MessageBoxW(hwnd,L"Batch list is full (64 jobs maximum).",
+                    L"SDR Trim",MB_OK|MB_ICONWARNING); break;
+            }
+            {
+                BatchJob *j=&g_jobs[g_job_count];
+                if(!build_cmdline(j->cmdline,4096)) break;
+                build_op_desc(j->op_desc,128);
+                wcsncpy(j->status,L"Pending",31);
+                /* Input short name */
+                wchar_t input[MAX_PATH];
+                GetWindowTextW(GetDlgItem(hwnd,ID_INPUT_EDIT),input,MAX_PATH);
+                wchar_t *fn=wcsrchr(input,L'\\');
+                wcsncpy(j->input_short,fn?fn+1:input,63);
+                /* Output short name */
+                wchar_t outfile[MAX_PATH]={0};
+                if(predict_outfile(input,outfile,MAX_PATH)){
+                    wchar_t *of=wcsrchr(outfile,L'\\');
+                    wcsncpy(j->output_short,of?of+1:outfile,63);
+                    wcsncpy(j->output_full, outfile, MAX_PATH-1);
+                } else {
+                    wcsncpy(j->output_short,L"(unknown)",63);
+                    j->output_full[0]=L'\0';
+                }
+                batch_list_add_row(g_job_count);
+                g_job_count++;
+                update_run_batch_button();
+            }
+            break;
+
+        case ID_RUN_BATCH:
+            if(g_running||g_job_count==0) break;
+            {
+                /* Check for output files that already exist */
+                wchar_t conflict_list[4096]={0};
+                int conflict_count=0;
+                for(int i=0;i<g_job_count;i++){
+                    if(wcscmp(g_jobs[i].status,L"Done")==0) continue;
+                    if(wcscmp(g_jobs[i].status,L"Cancelled")==0) continue;
+                    if(g_jobs[i].output_full[0] &&
+                       GetFileAttributesW(g_jobs[i].output_full)!=INVALID_FILE_ATTRIBUTES){
+                        conflict_count++;
+                        if(wcslen(conflict_list)<3900){
+                            wchar_t num[8]; _snwprintf(num,8,L"%d",i+1);
+                            wcsncat(conflict_list,L"  Job ",4095-wcslen(conflict_list));
+                            wcsncat(conflict_list,num,4095-wcslen(conflict_list));
+                            wcsncat(conflict_list,L": ",4095-wcslen(conflict_list));
+                            wcsncat(conflict_list,g_jobs[i].output_short,4095-wcslen(conflict_list));
+                            wcsncat(conflict_list,L"\n",4095-wcslen(conflict_list));
+                        }
+                    }
+                }
+                if(conflict_count>0){
+                    wchar_t msg[4096+128];
+                    _snwprintf(msg,4096+128,
+                        L"%d output file(s) already exist and will be overwritten:\n\n%s\nContinue?",
+                        conflict_count,conflict_list);
+                    if(MessageBoxW(hwnd,msg,L"SDR Trim Batch - Overwrite?",
+                            MB_YESNO|MB_ICONWARNING|MB_DEFBUTTON2)!=IDYES) break;
+                }
+                /* Reset all Pending/Cancelled jobs */
+                for(int i=0;i<g_job_count;i++)
+                    if(wcscmp(g_jobs[i].status,L"Pending")==0||
+                       wcscmp(g_jobs[i].status,L"Cancelled")==0)
+                        batch_list_set_status(i,L"Pending");
+                log_clear();
+                g_progress=0; InvalidateRect(GetDlgItem(hwnd,ID_PROGRESS),NULL,FALSE);
+                g_running=TRUE;
+                g_batch_run=TRUE;
+                EnableWindow(GetDlgItem(hwnd,ID_RUN),FALSE);
+                EnableWindow(GetDlgItem(hwnd,ID_RUN_BATCH),FALSE);
+                EnableWindow(GetDlgItem(hwnd,ID_CANCEL),TRUE);
+                SetWindowTextW(GetDlgItem(hwnd,ID_PCT_STATIC),L"");
+                SetWindowTextW(GetDlgItem(hwnd,ID_ETA_STATIC),L"");
+                g_thread=CreateThread(NULL,0,batch_thread,NULL,0,NULL);
+            }
+            break;
+
+        case ID_CLEAR_BATCH:
+            if(g_running) break;
+            g_job_count=0;
+            ListView_DeleteAllItems(GetDlgItem(hwnd,ID_BATCH_LIST));
+            update_run_batch_button();
+            break;
+        }
+        return 0;
+
+    /* Right-click context menu on batch list */
+    case WM_NOTIFY:{
+        NMHDR *nm=(NMHDR*)lp;
+        if(nm->idFrom==ID_BATCH_LIST&&nm->code==NM_CUSTOMDRAW){
+            NMLVCUSTOMDRAW *cd=(NMLVCUSTOMDRAW*)lp;
+            if(cd->nmcd.dwDrawStage==CDDS_PREPAINT)
+                return CDRF_NOTIFYITEMDRAW;
+            if(cd->nmcd.dwDrawStage==CDDS_ITEMPREPAINT)
+                return CDRF_NOTIFYSUBITEMDRAW;
+            if(cd->nmcd.dwDrawStage==(CDDS_ITEMPREPAINT|CDDS_SUBITEM)){
+                if(cd->iSubItem==COL_STATUS){
+                    int idx=(int)cd->nmcd.dwItemSpec;
+                    if(idx>=0&&idx<g_job_count){
+                        const wchar_t *st=g_jobs[idx].status;
+                        if(wcscmp(st,L"Done")==0){
+                            cd->clrText=RGB(0,140,0);
+                        } else if(wcscmp(st,L"Pending")==0){
+                            cd->clrText=RGB(160,100,0);
+                        } else if(wcscmp(st,L"Running")==0){
+                            cd->clrText=RGB(0,80,180);
+                        } else if(wcscmp(st,L"Failed")==0||
+                                  wcscmp(st,L"Cancelled")==0){
+                            cd->clrText=RGB(180,0,0);
+                        }
+                    }
+                }
+                return CDRF_NEWFONT;
+            }
+        }
+        if(nm->idFrom==ID_BATCH_LIST&&nm->code==NM_RCLICK){
+            NMITEMACTIVATE *nia=(NMITEMACTIVATE*)lp;
+            int idx=nia->iItem;
+            if(idx>=0&&idx<g_job_count&&!g_running){
+                POINT pt; GetCursorPos(&pt);
+                HMENU hm=CreatePopupMenu();
+                AppendMenuW(hm,MF_STRING,1,L"Remove job");
+                int cmd=TrackPopupMenu(hm,TPM_RETURNCMD|TPM_RIGHTBUTTON,pt.x,pt.y,0,hwnd,NULL);
+                DestroyMenu(hm);
+                if(cmd==1){
+                    /* Remove job at idx, shift rest down */
+                    for(int i=idx;i<g_job_count-1;i++) g_jobs[i]=g_jobs[i+1];
+                    g_job_count--;
+                    ListView_DeleteItem(GetDlgItem(hwnd,ID_BATCH_LIST),idx);
+                    /* Renumber remaining rows */
+                    for(int i=idx;i<g_job_count;i++) batch_list_refresh_row(i);
+                }
+            }
+        }
+        break;}
+
+    case WM_UPDATEPROG:{
+        int pct=(int)(WPARAM)wp;
+        if(pct!=g_progress){
+            g_progress=pct;
+            InvalidateRect(GetDlgItem(hwnd,ID_PROGRESS),NULL,FALSE);
+        }
+        wchar_t ps[8]; _snwprintf(ps,8,L"%d%%",pct);
+        SetWindowTextW(GetDlgItem(hwnd,ID_PCT_STATIC),ps);
+        return 0;}
+
+    case WM_UPDATEETA:
+        if(lp){ SetWindowTextW(GetDlgItem(hwnd,ID_ETA_STATIC),(wchar_t*)lp); free((void*)lp); }
+        return 0;
+
+    case WM_APPENDLOG:
+        if(wp==0&&lp){ log_append((wchar_t*)lp); free((void*)lp); }
+        else if(wp==1){
+            g_running=FALSE; g_hprocess=NULL;
+            EnableWindow(GetDlgItem(hwnd,ID_RUN),TRUE);
+            EnableWindow(GetDlgItem(hwnd,ID_CANCEL),FALSE);
+            SetWindowTextW(GetDlgItem(hwnd,ID_ETA_STATIC),L"");
+            DWORD ec=(DWORD)(ULONG_PTR)lp;
+            g_progress=(ec==0?100:0);
+            InvalidateRect(GetDlgItem(hwnd,ID_PROGRESS),NULL,FALSE);
+            InvalidateRect(hwnd,NULL,FALSE);
+            if(g_thread){ CloseHandle(g_thread); g_thread=NULL; }
+        }
+        return 0;
+
+    case WM_BATCHSTATUS:
+        if(lp){
+            int idx=(int)wp;
+            batch_list_set_status(idx,(wchar_t*)lp);
+            free((void*)lp);
+            update_run_batch_button();
+        }
+        return 0;
+
+    case WM_CONFIRM_OW:{
+            wchar_t *path=(wchar_t*)lp;
+            wchar_t msg[MAX_PATH+80];
+            wchar_t *fn=wcsrchr(path,L'\\');
+            _snwprintf(msg,MAX_PATH+80,
+                L"Output file already exists:\n\n%s\n\nOverwrite?",fn?fn+1:path);
+            int r=MessageBoxW(hwnd,msg,L"SDR Trim - Overwrite?",
+                MB_YESNO|MB_ICONWARNING|MB_DEFBUTTON2);
+            free(path);
+            return r;
+        }
+    case WM_BATCHDONE:
+        g_running=FALSE; g_batch_run=FALSE; g_hprocess=NULL;
+        EnableWindow(GetDlgItem(hwnd,ID_RUN),TRUE);
+        EnableWindow(GetDlgItem(hwnd,ID_CANCEL),FALSE);
+        update_run_batch_button();
+        SetWindowTextW(GetDlgItem(hwnd,ID_ETA_STATIC),L"");
+        log_append(L"Batch complete.\r\n");
+        InvalidateRect(hwnd,NULL,FALSE);
+        if(g_thread){ CloseHandle(g_thread); g_thread=NULL; }
+        return 0;
+
+    case WM_DROPFILES:{
+        wchar_t path[MAX_PATH];
+        DragQueryFileW((HDROP)wp,0,path,MAX_PATH);
+        SetWindowTextW(GetDlgItem(hwnd,ID_INPUT_EDIT),path);
+        DragFinish((HDROP)wp);
+        update_channel_controls();
+        update_format_controls();
+        populate_bw_dropdown(hwnd, g_sample_rate);
+        update_prediction();
+        return 0;}
+
+    case WM_CLOSE:{
+        /* Save window size */
+        RECT wr; GetWindowRect(hwnd,&wr);
+        ini_wi(L"W",L"cx",wr.right-wr.left);
+        ini_wi(L"W",L"cy",wr.bottom-wr.top);
+        /* Save ListView column widths */
+        HWND hlv=GetDlgItem(hwnd,ID_BATCH_LIST);
+        for(int col=0;col<5;col++){
+            int cw=ListView_GetColumnWidth(hlv,col);
+            wchar_t key[16]; _snwprintf(key,16,L"col%d",col);
+            ini_wi(L"Cols",key,cw);
+        }
+        save_settings();
+        DestroyWindow(hwnd);}
+        return 0;
+
+    case WM_DESTROY:
+        if(g_font)       DeleteObject(g_font);
+        if(g_font_bold)  DeleteObject(g_font_bold);
+        if(g_font_mono)  DeleteObject(g_font_mono);
+        if(g_font_title) DeleteObject(g_font_title);
+        if(g_hbr_bg)     DeleteObject(g_hbr_bg);
+        if(g_hbr_header) DeleteObject(g_hbr_header);
+        PostQuitMessage(0);
+        return 0;
+    }
+    return DefWindowProcW(hwnd,msg,wp,lp);
+}
+
+/* ------------------------------------------------------------------ */
+/*  WinMain                                                           */
+/* ------------------------------------------------------------------ */
+int WINAPI wWinMain(HINSTANCE hi,HINSTANCE hp,LPWSTR lp,int ns)
+{
+    (void)hp;(void)lp;
+    g_hinst=hi;
+    GetModuleFileNameW(NULL,g_exedir,MAX_PATH);
+    wchar_t *sl=wcsrchr(g_exedir,L'\\'); if(sl)*sl=L'\0';
+
+    SetProcessDPIAware();
+
+    INITCOMMONCONTROLSEX icc={sizeof(icc),
+        ICC_STANDARD_CLASSES|ICC_WIN95_CLASSES|ICC_LISTVIEW_CLASSES|ICC_BAR_CLASSES};
+    InitCommonControlsEx(&icc);
+
+    WNDCLASSEXW wc; ZeroMemory(&wc,sizeof(wc));
+    wc.cbSize=sizeof(wc); wc.style=CS_HREDRAW|CS_VREDRAW;
+    wc.lpfnWndProc=wnd_proc; wc.hInstance=hi;
+    wc.hIcon=LoadIconW(NULL,IDI_APPLICATION);
+    wc.hCursor=LoadCursorW(NULL,IDC_ARROW);
+    wc.hbrBackground=(HBRUSH)(COLOR_BTNFACE+1);
+    wc.lpszClassName=L"SDRTrimGUI";
+    RegisterClassExW(&wc);
+
+    int cw=780, ch=900;
+    RECT rc={0,0,cw,ch};
+    AdjustWindowRect(&rc,WS_OVERLAPPED|WS_CAPTION|WS_SYSMENU|WS_MINIMIZEBOX|WS_THICKFRAME,FALSE);
+    int ww=rc.right-rc.left, wh=rc.bottom-rc.top;
+    int sx=(GetSystemMetrics(SM_CXSCREEN)-ww)/2;
+    int sy=(GetSystemMetrics(SM_CYSCREEN)-wh)/2;
+
+    /* Restore saved window size if available */
+    wchar_t ini_p[MAX_PATH]; ini_path(ini_p,MAX_PATH);
+    int saved_cx=(int)GetPrivateProfileIntW(L"W",L"cx",0,ini_p);
+    int saved_cy=(int)GetPrivateProfileIntW(L"W",L"cy",0,ini_p);
+    if(saved_cx>=660&&saved_cy>=700){ ww=saved_cx; wh=saved_cy;
+        sx=(GetSystemMetrics(SM_CXSCREEN)-ww)/2;
+        sy=(GetSystemMetrics(SM_CYSCREEN)-wh)/2; }
+    HWND hwnd=CreateWindowExW(WS_EX_ACCEPTFILES,L"SDRTrimGUI",L"SDR Trim",
+        WS_OVERLAPPED|WS_CAPTION|WS_SYSMENU|WS_MINIMIZEBOX|WS_THICKFRAME|WS_MAXIMIZEBOX,
+        sx,sy,ww,wh,NULL,NULL,hi,NULL);
+
+    ShowWindow(hwnd,ns); UpdateWindow(hwnd);
+    MSG m;
+    while(GetMessageW(&m,NULL,0,0)){ TranslateMessage(&m); DispatchMessageW(&m); }
+    return (int)m.wParam;
 }
