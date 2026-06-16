@@ -58,6 +58,11 @@
 #define ID_HEADER_PANEL     123
 #define ID_CANCEL           124
 #define ID_REC_INFO         127
+#define ID_SR_INFO          128
+#define ID_SEQ_ADD          129
+#define SEQ_MAX             16   /* max files in sequence */
+#define ID_SEQ_LIST         134
+#define ID_SEQ_REMOVE       135
 #define ID_PCT_STATIC       125
 #define ID_ETA_STATIC       126
 /* Batch */
@@ -290,7 +295,7 @@ typedef char _chk_ds64[sizeof(Ds64Payload) == 28  ? 1 : -1];
 /* ------------------------------------------------------------------ */
 typedef struct {
     int32_t  sentinel;
-    double   timestamp;
+    double   timestamp;     /* seconds of day (WavViewDX convention) */
     double   passband_center;
     int32_t  passband_direction;
     int32_t  rx_input_mode;
@@ -825,8 +830,10 @@ static void build_linrad_filename(char *out, size_t sz,
 {
     int kHz=freq_hz/1000;
     (void)out_channels;
-    snprintf(out,sz,"%04d%02d%02d_%02d%02d%02d%d_%dkHz.raw",
-             year,month,day,hh,mm,ss,utc_offset,kHz);
+    /* Use 'Z' for UTC (offset=0), digit for other offsets */
+    char utc_ch = (utc_offset==0) ? 'Z' : ('0'+utc_offset);
+    snprintf(out,sz,"%04d%02d%02d_%02d%02d%02d%c_%dkHz.raw",
+             year,month,day,hh,mm,ss,utc_ch,kHz);
 }
 
 static void build_wavviewdx_filename(char *out, size_t sz,
@@ -1124,7 +1131,76 @@ static double *design_fir(double cutoff_norm,double trans_norm,
 #define COPY_BUF_FRAMES 65536
 #define CLIP16(x) ((int16_t)((x)>32767?32767:((x)<-32768?-32768:(int16_t)((x)+0.5))))
 
-static int copy_ddc(FILE *fin, FILE *fout,
+static volatile BOOL g_cancel;  /* forward declaration — defined in GUI globals */
+
+/* Sequence file list — shared between GUI and processing engine */
+static wchar_t   g_seq_paths[SEQ_MAX][MAX_PATH];
+static int       g_seq_count = 0;
+
+/* ------------------------------------------------------------------ */
+/*  Sequential file reader — transparently spans multiple input files  */
+/* ------------------------------------------------------------------ */
+typedef struct {
+    wchar_t  paths[SEQ_MAX][MAX_PATH];   /* wide paths */
+    int      count;         /* total files */
+    int      cur;           /* current file index */
+    FILE    *fp;            /* current open file handle */
+    int64_t  data_offset;   /* byte offset to data in current file */
+    int      in_ch;         /* channels per frame */
+    int      sample_rate;   /* samples per second */
+} SeqReader;
+
+/* Read exactly n_frames frames from the sequence, spanning files as needed.
+ * Returns number of frames actually read (may be < n_frames at end of sequence). */
+static size_t seq_read_frames(SeqReader *sr, int16_t *buf, size_t n_frames)
+{
+    size_t total = 0;
+    while(total < n_frames && sr->cur < sr->count){
+        if(!sr->fp){
+            sr->fp = _wfopen(sr->paths[sr->cur], L"rb");
+            if(!sr->fp){ sr->cur++; continue; }
+            file_seek(sr->fp, sr->data_offset, SEEK_SET);
+        }
+        size_t want = n_frames - total;
+        size_t got  = fread(buf + total*(size_t)sr->in_ch,
+                            sizeof(int16_t), want*(size_t)sr->in_ch, sr->fp);
+        size_t gf   = got / (size_t)sr->in_ch;
+        total += gf;
+        if(gf < want){
+            /* Exhausted this file — move to next */
+            fclose(sr->fp); sr->fp=NULL; sr->cur++;
+        }
+    }
+    return total;
+}
+
+static void seq_close(SeqReader *sr)
+{
+    if(sr->fp){ fclose(sr->fp); sr->fp=NULL; }
+}
+
+/* Seek sr to a frame position relative to the start of the whole sequence */
+static int seq_seek_frame(SeqReader *sr, uint64_t frame,
+                          const uint64_t *file_frames, int file_count)
+{
+    if(sr->fp){ fclose(sr->fp); sr->fp=NULL; }
+    uint64_t acc=0;
+    for(int i=0;i<file_count;i++){
+        if(frame < acc + file_frames[i]){
+            sr->cur = i;
+            sr->fp  = _wfopen(sr->paths[i],L"rb");
+            if(!sr->fp) return -1;
+            int64_t byte_off = sr->data_offset + (int64_t)(frame-acc)*(int64_t)sr->in_ch*2;
+            file_seek(sr->fp, byte_off, SEEK_SET);
+            return 0;
+        }
+        acc += file_frames[i];
+    }
+    sr->cur = file_count; /* past end */
+    return -1;
+}
+
+static int copy_ddc(SeqReader *sr, FILE *fout,
     uint64_t warmup_frames, uint64_t in_frames,
     int in_ch, int out_ch,
     const double *h, int n_taps, int D,
@@ -1164,10 +1240,9 @@ static int copy_ddc(FILE *fin, FILE *fout,
     while(warmup_left > 0){
         uint64_t batch=(warmup_left>(uint64_t)COPY_BUF_FRAMES)?
                         (uint64_t)COPY_BUF_FRAMES:warmup_left;
-        size_t got=fread(ibuf,sizeof(int16_t),(size_t)batch*in_ch,fin);
-        if(got==0) break;
-        int gf=(int)(got/in_ch);
-        for(int i=0;i<gf;i++){
+        size_t gf=seq_read_frames(sr,ibuf,batch);
+        if(gf==0) break;
+        for(int i=0;i<(int)gf;i++){
             float IA=(float)ibuf[i*in_ch+0], QA=(float)ibuf[i*in_ch+1];
             if(++head>=n_taps) head=0;
             dly_aI[head]=(float)(IA*dc-QA*ds);
@@ -1189,14 +1264,14 @@ static int copy_ddc(FILE *fin, FILE *fout,
     progress_print(label, 0, in_frames);
 
     while(left > 0){
+        if(g_cancel) break;
         uint64_t batch=(left>(uint64_t)COPY_BUF_FRAMES)?
                         (uint64_t)COPY_BUF_FRAMES:left;
-        size_t got=fread(ibuf,sizeof(int16_t),(size_t)batch*in_ch,fin);
-        if(got==0){ proc_log("\nWarning: source ended early.\n"); break; }
-        int gf=(int)(got/in_ch);
+        size_t gf=seq_read_frames(sr,ibuf,batch);
+        if(gf==0){ proc_log("\nWarning: source ended early.\n"); break; }
         int n_out=0;
 
-        for(int i=0; i<gf; i++){
+        for(int i=0; i<(int)gf; i++){
             /* Frequency-shift and push into circular delay line */
             float IA=(float)ibuf[i*in_ch+0], QA=(float)ibuf[i*in_ch+1];
             if(++head >= n_taps) head=0;
@@ -1259,7 +1334,7 @@ static int copy_ddc(FILE *fin, FILE *fout,
                 free(ibuf);free(obuf); return -1;
             }
         }
-        done+=(uint64_t)gf; left-=(uint64_t)gf;
+        done+=gf; left-=gf;
         progress_print(label,done,in_frames);
     }
     free(hf);free(dly_aI);free(dly_aQ);free(dly_bI);free(dly_bQ);
@@ -1271,7 +1346,7 @@ static int copy_ddc(FILE *fin, FILE *fout,
 /* ------------------------------------------------------------------ */
 /*  Streaming copy (no DDC, no resampling)                             */
 /* ------------------------------------------------------------------ */
-static int copy_passthrough(FILE *fin, FILE *fout,
+static int copy_passthrough(SeqReader *sr, FILE *fout,
     uint64_t total_frames, int in_ch, int out_ch,
     int src_idx, /* 0=chA IQ, 2=chB IQ, -1=all channels */
     const char *label)
@@ -1283,12 +1358,12 @@ static int copy_passthrough(FILE *fin, FILE *fout,
     uint64_t left=total_frames, done=0;
     progress_print(label,0,total_frames);
     while(left>0){
+        if(g_cancel) break;
         uint64_t batch=(left>(uint64_t)COPY_BUF_FRAMES)?(uint64_t)COPY_BUF_FRAMES:left;
-        size_t got=fread(ibuf,sizeof(int16_t),(size_t)batch*(size_t)in_ch,fin);
-        if(got==0){ proc_log("\nWarning: source ended early.\n"); break; }
-        size_t gf=got/(size_t)in_ch;
+        size_t gf=seq_read_frames(sr,ibuf,batch);
+        if(gf==0){ proc_log("\nWarning: source ended early.\n"); break; }
         if(src_idx<0){
-            if(fwrite(ibuf,sizeof(int16_t),got,fout)!=got){
+            if(fwrite(ibuf,sizeof(int16_t),gf*(size_t)in_ch,fout)!=gf*(size_t)in_ch){
                 proc_perror("\nfwrite"); free(ibuf);free(obuf); return -1; }
         } else {
             for(size_t f=0;f<gf;f++){
@@ -1422,7 +1497,7 @@ static int resamp_process_block(Resampler *rs,
     return out_count;
 }
 
-static int copy_resample(FILE *fin, FILE *fout,
+static int copy_resample(SeqReader *sr, FILE *fout,
     uint64_t in_frames, int in_ch, int out_ch,
     int fs_in, int fs_out,
     OutputChan ochan, const char *label)
@@ -1458,9 +1533,9 @@ static int copy_resample(FILE *fin, FILE *fout,
 
     while(left>0){
         uint64_t batch=(left>(uint64_t)BLOCK)?(uint64_t)BLOCK:left;
-        size_t got=fread(ibuf,sizeof(int16_t),(size_t)batch*in_ch,fin);
-        if(got==0){proc_log("\nWarning: source ended early.\n");break;}
-        int gf=(int)(got/in_ch);
+        size_t gf_s=seq_read_frames(sr,ibuf,batch);
+        if(gf_s==0){proc_log("\nWarning: source ended early.\n");break;}
+        int gf=(int)gf_s;
         block_num++;
 
         /* Extract channel */
@@ -1470,7 +1545,7 @@ static int copy_resample(FILE *fin, FILE *fout,
         }
 
         /* Resample */
-        int n_out=resamp_process_block(rs,mono,gf,obuf,out_block);
+        int n_out=resamp_process_block(rs,mono,(int)gf,obuf,out_block);
         if(n_out < 0 || n_out > out_block){
             proc_log("Error: resamp_process_block returned %d (out_block=%d)\n",
                      n_out, out_block);
@@ -1556,6 +1631,7 @@ static int sdr_process_args(int argc, char *argv[])
     for(int i=opt_start;i<argc;i++){
         if(strcmp(argv[i],"--ch1")==0){ ochan=OUT_CH1; ochan_set=1; }
         else if(strcmp(argv[i],"--ch2")==0){ ochan=OUT_CH2; ochan_set=1; }
+        else if(strcmp(argv[i],"--seq")==0){ i++; /* handled later in SeqReader build */ }
         else if(strcmp(argv[i],"linrad"    )==0) out_fmt=FMT_LINRAD;
         else if(strcmp(argv[i],"wavviewdx" )==0) out_fmt=FMT_WAVVIEWDX;
         else if(strcmp(argv[i],"sdruno"    )==0) out_fmt=FMT_SDRUNO;
@@ -1886,17 +1962,62 @@ static int sdr_process_args(int argc, char *argv[])
     }
     proc_log("Output file : %s\n\n",outpath);
 
-    /* ── Seek input to trim start ── */
-    uint64_t skip_bytes=start_frame*(uint64_t)rec.num_channels*2;
-    if(file_seek(fin,rec.data_offset+(int64_t)skip_bytes,SEEK_SET)!=0){
-        proc_log("Error seeking: %s\n",strerror(errno));
-        free(fir_h); fclose(fin); return 1; }
+    /* ── Build SeqReader from main input + any --seq files ── */
+    SeqReader sr; memset(&sr,0,sizeof(sr));
+    /* First file is always inpath (already open as fin) */
+    /* inpath is char* - convert to wchar_t */
+    MultiByteToWideChar(CP_UTF8,0,inpath,-1,sr.paths[0],MAX_PATH);
+    sr.count=1; sr.in_ch=rec.num_channels; sr.sample_rate=rec.sample_rate;
+    sr.data_offset=rec.data_offset; sr.cur=0; sr.fp=NULL;
+    /* Add sequence files from global g_seq_paths (set by GUI) */
+    proc_log("g_seq_count = %d\n", g_seq_count);
+    for(int si=0;si<g_seq_count && sr.count<SEQ_MAX;si++){
+        wcsncpy(sr.paths[sr.count],g_seq_paths[si],MAX_PATH-1);
+        proc_log("Adding seq: '%ls'\n", sr.paths[sr.count]);
+        sr.count++;
+    }
+    proc_log("Sequence    : %d file(s)\n",sr.count);
+    /* Total frames across all files in sequence */
+    uint64_t file_frames[SEQ_MAX]={0};
+    file_frames[0] = total_frames_in_file; /* main file */
+    uint64_t seq_total_frames = file_frames[0];
+    for(int si=1;si<sr.count;si++){
+        /* Use same data_offset as first file (same format/header size) */
+        FILE *sf=_wfopen(sr.paths[si],L"rb");
+        if(sf){
+            _fseeki64(sf,0,SEEK_END);
+            int64_t fsz=_ftelli64(sf); fclose(sf);
+            int64_t db=fsz-rec.data_offset;
+            if(db>0) file_frames[si]=(uint64_t)db/((uint64_t)rec.num_channels*2);
+        } else {
+            proc_log("Seq file %d : _wfopen failed errno=%d path='%ls'\n",si,errno,sr.paths[si]);
+        }
+        seq_total_frames += file_frames[si];
+        proc_log("Seq file %d : %ls (%llu frames)\n",si,sr.paths[si],(unsigned long long)file_frames[si]);
+    }
+    fclose(fin); fin=NULL; /* SeqReader manages file handles from here */
+
+    /* For full-file/convert with sequence, extend in_frames to cover all files */
+    if(do_convert && sr.count > 1){
+        uint64_t avail = seq_total_frames - start_frame;
+        if(avail > in_frames) in_frames = avail;
+    }
+    proc_log("Seq total   : %llu frames, start_frame=%llu, in_frames=%llu\n",
+             (unsigned long long)seq_total_frames,
+             (unsigned long long)start_frame,
+             (unsigned long long)in_frames);
+
+    /* ── Seek to trim start within sequence ── */
+
+    if(seq_seek_frame(&sr,start_frame,file_frames,sr.count)!=0){
+        proc_log("Error seeking to start frame.\n");
+        free(fir_h); return 1; }
 
     /* ── Open output ── */
     FILE *fout=fopen(outpath,"wb");
     if(!fout){
         proc_log("Error creating '%s': %s\n",outpath,strerror(errno));
-        free(fir_h); fclose(fin); return 1; }
+        free(fir_h); seq_close(&sr); return 1; }
 
     /* ── Write output header ── */
     int64_t ds64_pos=-1, data_sz32_pos=-1;
@@ -1931,7 +2052,7 @@ static int sdr_process_args(int argc, char *argv[])
                      out_fmt==FMT_JAGUAR?"Jaguar":"Perseus",
                      (double)expected_bytes/1e9,
                      (double)max_data/(target_sr*4));
-            fclose(fin); free(fir_h); return 1;
+            seq_close(&sr); free(fir_h); return 1;
         }
     }
 
@@ -1945,7 +2066,7 @@ static int sdr_process_args(int argc, char *argv[])
                  "  SDR Console hardcodes different sample rates for each format,\n"
                  "  making frequency-accurate conversion impossible.\n"
                  "  Convert to linrad, wavviewdx, sdruno or sdrconnect instead.\n");
-        fclose(fin); if(fout) fclose(fout); free(fir_h); return 1;
+        seq_close(&sr); if(fout) fclose(fout); free(fir_h); return 1;
     }
 
     /* Resampling: currently no cross-format resampling needed beyond the
@@ -1968,8 +2089,10 @@ static int sdr_process_args(int argc, char *argv[])
             LinradHdr oh=linrad_hdr;
             /* For non-Linrad input, populate fields from detected metadata */
             oh.sentinel=-1;
-            /* timestamp = seconds of day (Linrad convention, not Unix epoch) */
-            oh.timestamp=(double)(trim_sh*3600 + trim_sm*60 + trim_ss);
+            oh.rx_input_mode=0x26;  /* required by WavViewDX for valid Linrad file */
+            oh.timestamp=(double)start_epoch;
+            proc_log("Linrad timestamp: %.0f (Unix epoch = %02d:%02d:%02d UTC)\n",
+                     oh.timestamp,trim_sh,trim_sm,trim_ss);
             oh.passband_center=(double)ddc_cf_hz/1e6;
             oh.rx_rf_channels=(out_ch==4)?2:1;
             oh.rx_ad_channels=out_ch;
@@ -2015,22 +2138,22 @@ static int sdr_process_args(int argc, char *argv[])
         warmup_frames = (uint64_t)n_taps;
         if(warmup_frames > start_frame) warmup_frames = start_frame;
         if(warmup_frames > 0){
-            int64_t warmup_bytes = (int64_t)warmup_frames*(int64_t)rec.num_channels*2;
-            file_seek(fin, rec.data_offset+(int64_t)skip_bytes-(int64_t)warmup_bytes, SEEK_SET);
+            uint64_t wstart = (start_frame >= warmup_frames) ? start_frame - warmup_frames : 0;
+            seq_seek_frame(&sr, wstart, file_frames, sr.count);
             proc_log("DDC warmup  : %llu frames pre-read\n", (unsigned long long)warmup_frames);
         }
     }
 
     int rc;
     if(do_ddc){
-        rc=copy_ddc(fin,fout,warmup_frames,in_frames,rec.num_channels,out_ch,
+        rc=copy_ddc(&sr,fout,warmup_frames,in_frames,rec.num_channels,out_ch,
                     fir_h,n_taps,ddc_D,delta_phi,ochan,label);
     } else if(need_resamp){
-        rc=copy_resample(fin,fout,in_frames,rec.num_channels,out_ch,
+        rc=copy_resample(&sr,fout,in_frames,rec.num_channels,out_ch,
                          rec.sample_rate,resamp_target,ochan,label);
         fs_out=resamp_target;
     } else {
-        rc=copy_passthrough(fin,fout,in_frames,rec.num_channels,out_ch,
+        rc=copy_passthrough(&sr,fout,in_frames,rec.num_channels,out_ch,
                             src_idx,label);
     }
     if(rc!=0) goto write_error;
@@ -2041,13 +2164,13 @@ static int sdr_process_args(int argc, char *argv[])
         finalise_wav(fout,use_rf64,ds64_pos,data_sz32_pos,out_ch);
     }
 
-    fclose(fin); fclose(fout); free(fir_h);
+    seq_close(&sr); fclose(fout); free(fir_h);
     proc_log("Done. Output: %s\n",outpath);
     return 0;
 
 write_error:
     proc_log("Fatal error  -  removing partial output.\n");
-    fclose(fin); fclose(fout); free(fir_h);
+    seq_close(&sr); fclose(fout); free(fir_h);
     remove(outpath);
     return 1;
 }
@@ -2092,11 +2215,14 @@ typedef struct {
 static HWND      g_hwnd;
 static int       g_sample_rate = 0;  /* sample rate of currently loaded file */
 static wchar_t   g_rec_info[128] = {0};  /* recording start/end info string */
+static wchar_t   g_sr_info[32]  = {0};  /* sample rate info string */
+
 static HINSTANCE g_hinst;
 static BOOL      g_running    = FALSE;
 static BOOL      g_batch_run  = FALSE;
 static HANDLE    g_thread     = NULL;
 static HANDLE    g_hprocess   = NULL;
+static volatile BOOL g_cancel = FALSE;  /* set to TRUE to abort processing thread */
 static int       g_progress   = 0;
 static int       g_header_h   = 52;
 static HBRUSH    g_hbr_bg     = NULL;
@@ -2237,9 +2363,30 @@ static BOOL probe_file(const wchar_t *path,FileInfo *fi)
         fi->dual=(rd32(hdr+32)==4)?1:0;
         fi->sample_rate=(int)rd32(hdr+36);
         u64=0; for(int i=0;i<8;i++) u64|=(uint64_t)hdr[4+i]<<(i*8);
-        double ts; memcpy(&ts,&u64,8); int64_t ep=(int64_t)ts;
-        unix_to_utc(ep,&fi->year,&fi->mon,&fi->day,&fi->hour,&fi->min,&fi->sec);
+        /* Linrad timestamp: new files store seconds-of-day, old files stored Unix epoch.
+         * Distinguish by value: seconds-of-day is always < 86400. */
+        /* timestamp is Unix epoch as double at bytes 4-11 */
+        uint64_t ts_u64=0; for(int i=0;i<8;i++) ts_u64|=(uint64_t)hdr[4+i]<<(i*8);
+        double ts; memcpy(&ts,&ts_u64,8);
+        if(ts >= 86400.0){
+            /* Unix epoch as double */
+            int yy,mo,dd,hh,mi,ss;
+            unix_to_utc((int64_t)ts,&yy,&mo,&dd,&hh,&mi,&ss);
+            fi->hour=hh; fi->min=mi; fi->sec=ss;
+        } else {
+            /* Legacy seconds-of-day */
+            int sod=(int)ts;
+            fi->hour=sod/3600; fi->min=(sod%3600)/60; fi->sec=sod%60;
+        }
+        fi->year=0; fi->mon=0; fi->day=0;
         const wchar_t *bn=wcsrchr(path,L'\\'); if(!bn)bn=path; else bn++;
+        /* Linrad filename: yyyymmdd_hhmmssU_xxxkHz.raw */
+        int yy=0,mo=0,dd=0,hh=0,mi=0,ss=0;
+        if(swscanf(bn,L"%4d%2d%2d_%2d%2d%2d",&yy,&mo,&dd,&hh,&mi,&ss)==6
+           && yy>2000 && mo>=1 && mo<=12 && dd>=1 && dd<=31){
+            fi->year=yy; fi->mon=mo; fi->day=dd;
+            fi->hour=hh; fi->min=mi; fi->sec=ss;
+        }
         if(wcslen(bn)>16){ wchar_t uc=bn[15]; fi->utc_digit=(uc>=L'0'&&uc<=L'9')?(int)(uc-L'0'):0; }
         return TRUE;
     }
@@ -2421,11 +2568,10 @@ static BOOL predict_outfile(const wchar_t *inpath,wchar_t *outfile,int n)
         }
     }
     wchar_t name[MAX_PATH];
-    OutputChan ochan = IsDlgButtonChecked(g_hwnd,ID_CHAN_CH2) ? OUT_CH2 :
-                       IsDlgButtonChecked(g_hwnd,ID_CHAN_CH1) ? OUT_CH1 : OUT_DUAL;
+
     switch(out_fmt){
-    case 0: _snwprintf(name,MAX_PATH,L"%04d%02d%02d_%02d%02d%02d%d_%dkHz.raw",
-                sy,smo,sd,sh,smi,0,fi.utc_digit,cf/1000); break;
+    case 0: _snwprintf(name,MAX_PATH,L"%04d%02d%02d_%02d%02d%02dZ_%dkHz.raw",
+                sy,smo,sd,sh,smi,0,cf/1000); break;
     case 1: _snwprintf(name,MAX_PATH,L"iq_pcm16_ch%d_cf%d_sr%d_dt%04d%02d%02d-%02d%02d%02d.raw",
                 dual_out?2:1,cf,sr,sy,smo,sd,sh,smi,0); break;
     case 2: _snwprintf(name,MAX_PATH,L"SDRuno_%04d%02d%02d_%02d%02d%02dZ_%dkHz.wav",
@@ -2500,6 +2646,12 @@ static BOOL build_cmdline(wchar_t *cmd,int n)
         wchar_t d[64]; _snwprintf(d,64,L" --ddc %s %s",cf,bw);
         wcsncat(cmd,d,n-wcslen(cmd)-1);
     }
+    /* Append --seq paths for each sequence file */
+    for(int si=0;si<g_seq_count;si++){
+        wcsncat(cmd,L" --seq \"",n-wcslen(cmd)-1);
+        wcsncat(cmd,g_seq_paths[si],n-wcslen(cmd)-1);
+        wcsncat(cmd,L"\"",n-wcslen(cmd)-1);
+    }
     return TRUE;
 }
 
@@ -2562,8 +2714,7 @@ static void update_channel_controls(void)
     g_sample_rate = fi.sample_rate;
 
     /* Build recording time info string */
-    if(input[0] && fi.fmt >= 0 && fi.year > 0 && fi.sample_rate > 0){
-        /* Get file size to compute duration */
+    if(input[0] && fi.fmt >= 0 && fi.sample_rate > 0){
         struct _stat64 st; int dur_sec=0;
         if(_wstat64(input,&st)==0 && st.st_size > 0){
             int ch = fi.dual ? 4 : 2;
@@ -2571,20 +2722,34 @@ static void update_channel_controls(void)
             if(data_bytes > 0)
                 dur_sec = (int)(data_bytes / ((int64_t)fi.sample_rate * ch * 2));
         }
-        int64_t file_ep = utc_to_unix(fi.year,fi.mon,fi.day,fi.hour,fi.min,fi.sec);
-        int64_t end_ep  = file_ep + dur_sec;
-        int ey,emo,ed,eh,emi,es;
-        unix_to_utc(end_ep,&ey,&emo,&ed,&eh,&emi,&es);
+        /* Add durations of any sequence files */
+        for(int si=0; si<g_seq_count; si++){
+            struct _stat64 st2;
+            if(_wstat64(g_seq_paths[si],&st2)==0 && st2.st_size > 0){
+                int ch = fi.dual ? 4 : 2;
+                int64_t data_bytes = st2.st_size - 200; /* WAV header allowance */
+                if(data_bytes > 0)
+                    dur_sec += (int)(data_bytes / ((int64_t)fi.sample_rate * ch * 2));
+            }
+        }
+        int end_sod = fi.hour*3600 + fi.min*60 + fi.sec + dur_sec;
         _snwprintf(g_rec_info,128,
-            L"Recording:  %04d-%02d-%02d  %02d:%02d:%02d — %02d:%02d:%02d UTC  (%d s)",
-            fi.year,fi.mon,fi.day,
+            L"Recording:  %02d:%02d:%02d — %02d:%02d:%02d UTC  (%dh %02dm)",
             fi.hour,fi.min,fi.sec,
-            eh,emi,es,
-            dur_sec);
+            (end_sod/3600)%24,(end_sod%3600)/60,end_sod%60,
+            dur_sec/3600,(dur_sec%3600)/60);
     } else {
         wcscpy(g_rec_info,L"Recording:  (no file loaded)");
     }
-    SetWindowTextW(GetDlgItem(g_hwnd,ID_REC_INFO),g_rec_info);
+        SetWindowTextW(GetDlgItem(g_hwnd,ID_REC_INFO),g_rec_info);
+
+    /* Sample rate display */
+    if(input[0] && fi.sample_rate > 0){
+        _snwprintf(g_sr_info,32,L"Sample rate: %d sps",fi.sample_rate);
+    } else {
+        g_sr_info[0]=L'\0';
+    }
+    SetWindowTextW(GetDlgItem(g_hwnd,ID_SR_INFO),g_sr_info);
 
     BOOL dual = fi.dual;
     EnableWindow(GetDlgItem(g_hwnd,ID_CHAN_DUAL), dual);
@@ -2841,6 +3006,7 @@ typedef struct { wchar_t cmdline[4096]; } ThreadArgs;
 
 static DWORD WINAPI run_thread(LPVOID param)
 {
+    g_cancel=FALSE;
     ThreadArgs *args=(ThreadArgs*)param;
     DWORD ec=run_one_job(args->cmdline);
     wchar_t done[128];
@@ -2862,6 +3028,7 @@ static DWORD WINAPI batch_thread(LPVOID param)
 {
     (void)param;
     for(int i=0;i<g_job_count;i++){
+        g_cancel=FALSE;
         /* Skip if already cancelled */
         if(wcscmp(g_jobs[i].status,L"Cancelled")==0) continue;
 
@@ -3052,15 +3219,26 @@ static void create_controls(HWND hwnd)
     int M=12, y=g_header_h+14;
 
     /* ── Input ── */
-    mk_group(hwnd,L"Input File",M,y,W-M*2,76);
-    mk_edit(hwnd,ID_INPUT_EDIT,M+10,y+22,W-M*2-86,24,FALSE,FALSE);
-    mk_btn(hwnd,ID_BROWSE,L"Browse...",W-M-74,y+22,72,24,BS_PUSHBUTTON);
-    /* Recording info line — shows start/end time of loaded file */
+    mk_group(hwnd,L"Input File",M,y,W-M*2,140);
+    mk_edit(hwnd,ID_INPUT_EDIT,M+10,y+22,W-M*2-166,24,FALSE,FALSE);
+    mk_btn(hwnd,ID_BROWSE,L"Browse...",W-M-154,y+22,72,24,BS_PUSHBUTTON);
+    mk_btn(hwnd,ID_SEQ_ADD,L"+ Add",W-M-74,y+22,62,24,BS_PUSHBUTTON);
+    /* Recording info line */
     { HWND hi=CreateWindowExW(0,L"STATIC",L"Recording:  (no file loaded)",
         WS_CHILD|WS_VISIBLE|SS_LEFT,
-        M+10,y+50,W-M*2-20,20,hwnd,(HMENU)(UINT_PTR)ID_REC_INFO,g_hinst,NULL);
+        M+10,y+50,W-M*2-200,20,hwnd,(HMENU)(UINT_PTR)ID_REC_INFO,g_hinst,NULL);
       SendMessageW(hi,WM_SETFONT,(WPARAM)g_font,FALSE); }
-    y+=84;
+    { HWND hs=CreateWindowExW(0,L"STATIC",L"",
+        WS_CHILD|WS_VISIBLE|SS_RIGHT,
+        W-M-186,y+50,180,20,hwnd,(HMENU)(UINT_PTR)ID_SR_INFO,g_hinst,NULL);
+      SendMessageW(hs,WM_SETFONT,(WPARAM)g_font,FALSE); }
+    /* Sequence listbox */
+    { HWND hl=CreateWindowExW(WS_EX_CLIENTEDGE,L"LISTBOX",NULL,
+        WS_CHILD|WS_VISIBLE|WS_VSCROLL|LBS_NOTIFY|LBS_NOINTEGRALHEIGHT,
+        M+10,y+74,W-M*2-72,52,hwnd,(HMENU)(UINT_PTR)ID_SEQ_LIST,g_hinst,NULL);
+      SendMessageW(hl,WM_SETFONT,(WPARAM)g_font_mono,FALSE); }
+    mk_btn(hwnd,ID_SEQ_REMOVE,L"Remove",W-M-60,y+74,58,24,BS_PUSHBUTTON);
+    y+=148;
 
     /* ── Mode ── */
     mk_group(hwnd,L"Mode",M,y,W-M*2,54);
@@ -3202,6 +3380,9 @@ static void browse_file(void)
     ofn.lpstrTitle=L"Select Input Recording";
     if(GetOpenFileNameW(&ofn)){
         SetWindowTextW(GetDlgItem(g_hwnd,ID_INPUT_EDIT),buf);
+        /* Clear sequence list when new primary file selected */
+        g_seq_count=0;
+        SendDlgItemMessageW(g_hwnd,ID_SEQ_LIST,LB_RESETCONTENT,0,0);
         update_channel_controls();
         update_format_controls();
         update_prediction();
@@ -3247,14 +3428,19 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp)
                 SWP_NOZORDER|SWP_NOACTIVATE);
 
         /* Input edit stretches, Browse stays right */
-        MV(ID_INPUT_EDIT, M+10,     g_header_h+14+22,  W-M*2-86,  24)
-        MV(ID_BROWSE,     W-M-74,   g_header_h+14+22,  72,        24)
+        MV(ID_INPUT_EDIT, M+10,       g_header_h+14+22,  W-M*2-166, 24)
+        MV(ID_BROWSE,     W-M-154,   g_header_h+14+22,  72,        24)
+        MV(ID_SEQ_ADD,    W-M-74,    g_header_h+14+22,  62,        24)
+        MV(ID_REC_INFO,   M+10,      g_header_h+14+50,  W-M*2-200, 20)
+        MV(ID_SR_INFO,    W-M-186,   g_header_h+14+50,  180,       20)
+        MV(ID_SEQ_LIST,   M+10,      g_header_h+14+74,  W-M*2-72,  52)
+        MV(ID_SEQ_REMOVE, W-M-60,    g_header_h+14+74,  58,        24)
 
         /* Prediction label stretches */
-        MV(ID_OUTFILE_STATIC, M+2,  373,  W-M*2-4, 18)
+        MV(ID_OUTFILE_STATIC, M+2,  458,  W-M*2-4, 18)
 
         /* Log group + edit stretch */
-        int log_top = 399;
+        int log_top = 484;
         int log_group_h = 120;
         MV(ID_LOG_EDIT,   M+8,      log_top+20, W-M*2-16, log_group_h)
         MV(ID_LOG_GROUP,  M,        log_top,    W-M*2,    log_group_h+22)
@@ -3323,7 +3509,7 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp)
             SetTextColor(di->hDC,CLR_HEADER_TEXT);
             if(g_font_title) SelectObject(di->hDC,g_font_title);
             RECT tr=di->rcItem; tr.left+=14;
-            DrawTextW(di->hDC,L"SDR Trim  v1.5",-1,&tr,DT_LEFT|DT_VCENTER|DT_SINGLELINE);
+            DrawTextW(di->hDC,L"SDR Trim  v1.5.1",-1,&tr,DT_LEFT|DT_VCENTER|DT_SINGLELINE);
             /* Name on right — use normal font, slightly smaller */
             if(g_font) SelectObject(di->hDC,g_font);
             RECT nr=di->rcItem; nr.right-=14;
@@ -3335,6 +3521,58 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp)
     case WM_COMMAND:
         switch(LOWORD(wp)){
         case ID_BROWSE: browse_file(); break;
+
+        case ID_SEQ_ADD:{
+            if(g_seq_count >= SEQ_MAX){
+                MessageBoxW(hwnd,L"Maximum sequence files reached.",L"SDR Trim",MB_OK|MB_ICONWARNING);
+                break;
+            }
+            wchar_t buf[MAX_PATH]={0};
+            OPENFILENAMEW ofn; ZeroMemory(&ofn,sizeof(ofn));
+            ofn.lStructSize=sizeof(ofn); ofn.hwndOwner=hwnd;
+            ofn.lpstrFilter=L"SDRuno WAV\0*.wav\0All IQ Files\0*.raw;*.wav\0";
+            ofn.lpstrFile=buf; ofn.nMaxFile=MAX_PATH;
+            ofn.Flags=OFN_FILEMUSTEXIST|OFN_PATHMUSTEXIST;
+            ofn.lpstrTitle=L"Add Sequence File";
+            if(GetOpenFileNameW(&ofn)){
+                /* Validate: same format/sample rate as primary */
+                FileInfo fi2; memset(&fi2,0,sizeof(fi2));
+                probe_file(buf,&fi2);
+                FileInfo fi1; memset(&fi1,0,sizeof(fi1));
+                wchar_t primary[MAX_PATH]={0};
+                GetWindowTextW(GetDlgItem(hwnd,ID_INPUT_EDIT),primary,MAX_PATH);
+                if(primary[0]) probe_file(primary,&fi1);
+                if(fi1.sample_rate>0 && fi2.sample_rate!=fi1.sample_rate){
+                    MessageBoxW(hwnd,L"Sample rate does not match primary file.",L"SDR Trim",MB_OK|MB_ICONWARNING);
+                    break;
+                }
+                if(fi1.fmt>=0 && fi2.fmt!=fi1.fmt){
+                    MessageBoxW(hwnd,L"Format does not match primary file.",L"SDR Trim",MB_OK|MB_ICONWARNING);
+                    break;
+                }
+                wcsncpy(g_seq_paths[g_seq_count],buf,MAX_PATH-1);
+                g_seq_count++;
+                /* Add short filename to listbox */
+                const wchar_t *fn=wcsrchr(buf,L'\\'); fn=fn?fn+1:buf;
+                SendDlgItemMessageW(hwnd,ID_SEQ_LIST,LB_ADDSTRING,0,(LPARAM)fn);
+                update_channel_controls();
+                update_prediction();
+            }
+            break;
+        }
+
+        case ID_SEQ_REMOVE:{
+            int sel=(int)SendDlgItemMessageW(hwnd,ID_SEQ_LIST,LB_GETCURSEL,0,0);
+            if(sel==LB_ERR) break;
+            SendDlgItemMessageW(hwnd,ID_SEQ_LIST,LB_DELETESTRING,sel,0);
+            /* Shift paths down */
+            for(int i=sel;i<g_seq_count-1;i++)
+                wcsncpy(g_seq_paths[i],g_seq_paths[i+1],MAX_PATH-1);
+            g_seq_count--;
+            update_channel_controls();
+            update_prediction();
+            break;
+        }
         case ID_MODE_FULL:
             EnableWindow(GetDlgItem(hwnd,ID_START_EDIT),FALSE);
             EnableWindow(GetDlgItem(hwnd,ID_END_EDIT),  FALSE);
@@ -3408,10 +3646,16 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp)
             break;
 
         case ID_CANCEL:
-            if(g_running&&g_hprocess){
-                g_batch_run=FALSE;  /* signal batch to stop */
-                TerminateProcess(g_hprocess,1);
+            if(g_running&&g_thread){
+                g_cancel=TRUE;
+                g_batch_run=FALSE;
+                /* Give thread 500ms to notice g_cancel, then force-terminate */
+                if(WaitForSingleObject(g_thread,500)!=WAIT_OBJECT_0)
+                    TerminateThread(g_thread,1);
                 log_append(L"Cancelled by user.\r\n");
+                g_running=FALSE;
+                EnableWindow(GetDlgItem(hwnd,ID_RUN),TRUE);
+                EnableWindow(GetDlgItem(hwnd,ID_CANCEL),FALSE);
             }
             break;
 
