@@ -57,6 +57,7 @@
 #define ID_PROGRESS         122
 #define ID_HEADER_PANEL     123
 #define ID_CANCEL           124
+#define ID_REC_INFO         127
 #define ID_PCT_STATIC       125
 #define ID_ETA_STATIC       126
 /* Batch */
@@ -1124,7 +1125,8 @@ static double *design_fir(double cutoff_norm,double trans_norm,
 #define CLIP16(x) ((int16_t)((x)>32767?32767:((x)<-32768?-32768:(int16_t)((x)+0.5))))
 
 static int copy_ddc(FILE *fin, FILE *fout,
-    uint64_t in_frames, int in_ch, int out_ch,
+    uint64_t warmup_frames, uint64_t in_frames,
+    int in_ch, int out_ch,
     const double *h, int n_taps, int D,
     double delta_phi, OutputChan ochan,
     const char *label)
@@ -1152,9 +1154,37 @@ static int copy_ddc(FILE *fin, FILE *fout,
     /* Running phase rotation: dc+j*ds = e^{j*phi}, step by delta_phi each sample */
     double dc=1.0, ds=0.0;
     double dc_step=cos(delta_phi), ds_step=sin(delta_phi);
+    int head=0, phase=0;
 
-    int head=0;     /* circular buffer write head 0..n_taps-1 */
-    int phase=0;    /* 0..D-1; compute FIR output when phase==0 */
+    /* ── Warmup: pre-fill delay line without writing output ──
+     * Read warmup_frames of input that precede the trim start.
+     * This populates the FIR delay line so the first output sample
+     * is computed from real data, eliminating startup corruption. */
+    uint64_t warmup_left = warmup_frames;
+    while(warmup_left > 0){
+        uint64_t batch=(warmup_left>(uint64_t)COPY_BUF_FRAMES)?
+                        (uint64_t)COPY_BUF_FRAMES:warmup_left;
+        size_t got=fread(ibuf,sizeof(int16_t),(size_t)batch*in_ch,fin);
+        if(got==0) break;
+        int gf=(int)(got/in_ch);
+        for(int i=0;i<gf;i++){
+            float IA=(float)ibuf[i*in_ch+0], QA=(float)ibuf[i*in_ch+1];
+            if(++head>=n_taps) head=0;
+            dly_aI[head]=(float)(IA*dc-QA*ds);
+            dly_aQ[head]=(float)(IA*ds+QA*dc);
+            if(do_b){
+                float IB=(float)ibuf[i*in_ch+2], QB=(float)ibuf[i*in_ch+3];
+                dly_bI[head]=(float)(IB*dc-QB*ds);
+                dly_bQ[head]=(float)(IB*ds+QB*dc);
+            }
+            double dc2=dc*dc_step-ds*ds_step;
+            double ds2=dc*ds_step+ds*dc_step;
+            dc=dc2; ds=ds2;
+            if((i&4095)==0){double inv=1.0/sqrt(dc*dc+ds*ds);dc*=inv;ds*=inv;}
+            if(++phase>=D) phase=0;
+        }
+        warmup_left-=(uint64_t)gf;
+    }
     uint64_t left=in_frames, done=0;
     progress_print(label, 0, in_frames);
 
@@ -1938,7 +1968,8 @@ static int sdr_process_args(int argc, char *argv[])
             LinradHdr oh=linrad_hdr;
             /* For non-Linrad input, populate fields from detected metadata */
             oh.sentinel=-1;
-            oh.timestamp=(double)start_epoch;
+            /* timestamp = seconds of day (Linrad convention, not Unix epoch) */
+            oh.timestamp=(double)(trim_sh*3600 + trim_sm*60 + trim_ss);
             oh.passband_center=(double)ddc_cf_hz/1e6;
             oh.rx_rf_channels=(out_ch==4)?2:1;
             oh.rx_ad_channels=out_ch;
@@ -1976,9 +2007,23 @@ static int sdr_process_args(int argc, char *argv[])
     int src_idx = (ochan==OUT_CH2)?2:(ochan==OUT_CH1)?0:-1;
     const char *label = do_ddc ? "DDC+Write " : "Writing   ";
 
+    /* DDC filter warmup: seek back n_taps input frames before trim start
+     * so the delay line is fully populated before output begins.
+     * This eliminates the corrupted startup frames at the beginning of output. */
+    uint64_t warmup_frames = 0;
+    if(do_ddc && n_taps > 0){
+        warmup_frames = (uint64_t)n_taps;
+        if(warmup_frames > start_frame) warmup_frames = start_frame;
+        if(warmup_frames > 0){
+            int64_t warmup_bytes = (int64_t)warmup_frames*(int64_t)rec.num_channels*2;
+            file_seek(fin, rec.data_offset+(int64_t)skip_bytes-(int64_t)warmup_bytes, SEEK_SET);
+            proc_log("DDC warmup  : %llu frames pre-read\n", (unsigned long long)warmup_frames);
+        }
+    }
+
     int rc;
     if(do_ddc){
-        rc=copy_ddc(fin,fout,in_frames,rec.num_channels,out_ch,
+        rc=copy_ddc(fin,fout,warmup_frames,in_frames,rec.num_channels,out_ch,
                     fir_h,n_taps,ddc_D,delta_phi,ochan,label);
     } else if(need_resamp){
         rc=copy_resample(fin,fout,in_frames,rec.num_channels,out_ch,
@@ -2046,6 +2091,7 @@ typedef struct {
 /* ------------------------------------------------------------------ */
 static HWND      g_hwnd;
 static int       g_sample_rate = 0;  /* sample rate of currently loaded file */
+static wchar_t   g_rec_info[128] = {0};  /* recording start/end info string */
 static HINSTANCE g_hinst;
 static BOOL      g_running    = FALSE;
 static BOOL      g_batch_run  = FALSE;
@@ -2514,6 +2560,32 @@ static void update_channel_controls(void)
     FileInfo fi; fi.dual=1; /* default: assume dual if unknown */
     if(input[0]) probe_file(input,&fi);
     g_sample_rate = fi.sample_rate;
+
+    /* Build recording time info string */
+    if(input[0] && fi.fmt >= 0 && fi.year > 0 && fi.sample_rate > 0){
+        /* Get file size to compute duration */
+        struct _stat64 st; int dur_sec=0;
+        if(_wstat64(input,&st)==0 && st.st_size > 0){
+            int ch = fi.dual ? 4 : 2;
+            int64_t data_bytes = st.st_size - (fi.fmt<=1 ? 41 : 200);
+            if(data_bytes > 0)
+                dur_sec = (int)(data_bytes / ((int64_t)fi.sample_rate * ch * 2));
+        }
+        int64_t file_ep = utc_to_unix(fi.year,fi.mon,fi.day,fi.hour,fi.min,fi.sec);
+        int64_t end_ep  = file_ep + dur_sec;
+        int ey,emo,ed,eh,emi,es;
+        unix_to_utc(end_ep,&ey,&emo,&ed,&eh,&emi,&es);
+        _snwprintf(g_rec_info,128,
+            L"Recording:  %04d-%02d-%02d  %02d:%02d:%02d — %02d:%02d:%02d UTC  (%d s)",
+            fi.year,fi.mon,fi.day,
+            fi.hour,fi.min,fi.sec,
+            eh,emi,es,
+            dur_sec);
+    } else {
+        wcscpy(g_rec_info,L"Recording:  (no file loaded)");
+    }
+    SetWindowTextW(GetDlgItem(g_hwnd,ID_REC_INFO),g_rec_info);
+
     BOOL dual = fi.dual;
     EnableWindow(GetDlgItem(g_hwnd,ID_CHAN_DUAL), dual);
     EnableWindow(GetDlgItem(g_hwnd,ID_CHAN_CH2),  dual);
@@ -2980,10 +3052,15 @@ static void create_controls(HWND hwnd)
     int M=12, y=g_header_h+14;
 
     /* ── Input ── */
-    mk_group(hwnd,L"Input File",M,y,W-M*2,54);
+    mk_group(hwnd,L"Input File",M,y,W-M*2,76);
     mk_edit(hwnd,ID_INPUT_EDIT,M+10,y+22,W-M*2-86,24,FALSE,FALSE);
     mk_btn(hwnd,ID_BROWSE,L"Browse...",W-M-74,y+22,72,24,BS_PUSHBUTTON);
-    y+=63;
+    /* Recording info line — shows start/end time of loaded file */
+    { HWND hi=CreateWindowExW(0,L"STATIC",L"Recording:  (no file loaded)",
+        WS_CHILD|WS_VISIBLE|SS_LEFT,
+        M+10,y+50,W-M*2-20,20,hwnd,(HMENU)(UINT_PTR)ID_REC_INFO,g_hinst,NULL);
+      SendMessageW(hi,WM_SETFONT,(WPARAM)g_font,FALSE); }
+    y+=84;
 
     /* ── Mode ── */
     mk_group(hwnd,L"Mode",M,y,W-M*2,54);
