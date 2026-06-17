@@ -1,5 +1,7 @@
 # SDR Trim  v1.5.1
 
+This is beta software. Contact me if you experience bugs or any other issues with this software. Currently under test. 
+
 IQ recording utility for SDRplay RSPdx, RSPduo, Perseus, and Jaguar receivers.
 
 **Trim · Convert · Extract · DDC**
