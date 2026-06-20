@@ -1132,6 +1132,7 @@ static double *design_fir(double cutoff_norm,double trans_norm,
 #define CLIP16(x) ((int16_t)((x)>32767?32767:((x)<-32768?-32768:(int16_t)((x)+0.5))))
 
 static volatile BOOL g_cancel;  /* forward declaration — defined in GUI globals */
+static volatile BOOL g_pause;   /* forward declaration — defined in GUI globals */
 
 /* Sequence file list — shared between GUI and processing engine */
 static wchar_t   g_seq_paths[SEQ_MAX][MAX_PATH];
@@ -1200,6 +1201,16 @@ static int seq_seek_frame(SeqReader *sr, uint64_t frame,
     return -1;
 }
 
+/* Called once per block in each copy loop. Blocks while g_pause is set,
+ * waking periodically to recheck. Returns immediately if g_cancel becomes
+ * set while paused, so a paused job can still be cancelled cleanly. */
+static void wait_if_paused(void)
+{
+    while(g_pause && !g_cancel){
+        Sleep(100);
+    }
+}
+
 static int copy_ddc(SeqReader *sr, FILE *fout,
     uint64_t warmup_frames, uint64_t in_frames,
     int in_ch, int out_ch,
@@ -1238,6 +1249,9 @@ static int copy_ddc(SeqReader *sr, FILE *fout,
      * is computed from real data, eliminating startup corruption. */
     uint64_t warmup_left = warmup_frames;
     while(warmup_left > 0){
+        if(g_cancel) break;
+        wait_if_paused();
+        if(g_cancel) break;
         uint64_t batch=(warmup_left>(uint64_t)COPY_BUF_FRAMES)?
                         (uint64_t)COPY_BUF_FRAMES:warmup_left;
         size_t gf=seq_read_frames(sr,ibuf,batch);
@@ -1264,6 +1278,8 @@ static int copy_ddc(SeqReader *sr, FILE *fout,
     progress_print(label, 0, in_frames);
 
     while(left > 0){
+        if(g_cancel) break;
+        wait_if_paused();
         if(g_cancel) break;
         uint64_t batch=(left>(uint64_t)COPY_BUF_FRAMES)?
                         (uint64_t)COPY_BUF_FRAMES:left;
@@ -1340,7 +1356,7 @@ static int copy_ddc(SeqReader *sr, FILE *fout,
     free(hf);free(dly_aI);free(dly_aQ);free(dly_bI);free(dly_bQ);
     free(ibuf);free(obuf);
     progress_done();
-    return 0;
+    return g_cancel ? 2 : 0;
 }
 
 /* ------------------------------------------------------------------ */
@@ -1358,6 +1374,8 @@ static int copy_passthrough(SeqReader *sr, FILE *fout,
     uint64_t left=total_frames, done=0;
     progress_print(label,0,total_frames);
     while(left>0){
+        if(g_cancel) break;
+        wait_if_paused();
         if(g_cancel) break;
         uint64_t batch=(left>(uint64_t)COPY_BUF_FRAMES)?(uint64_t)COPY_BUF_FRAMES:left;
         size_t gf=seq_read_frames(sr,ibuf,batch);
@@ -1378,7 +1396,7 @@ static int copy_passthrough(SeqReader *sr, FILE *fout,
     }
     free(ibuf);free(obuf);
     progress_done();
-    return 0;
+    return g_cancel ? 2 : 0;
 }
 
 /* ================================================================== */
@@ -1532,6 +1550,9 @@ static int copy_resample(SeqReader *sr, FILE *fout,
     progress_print(label,0,in_frames);
 
     while(left>0){
+        if(g_cancel) break;
+        wait_if_paused();
+        if(g_cancel) break;
         uint64_t batch=(left>(uint64_t)BLOCK)?(uint64_t)BLOCK:left;
         size_t gf_s=seq_read_frames(sr,ibuf,batch);
         if(gf_s==0){proc_log("\nWarning: source ended early.\n");break;}
@@ -1564,7 +1585,7 @@ static int copy_resample(SeqReader *sr, FILE *fout,
     }
     free(ibuf);free(mono);free(obuf);resamp_free(rs);
     progress_done();
-    return 0;
+    return g_cancel ? 2 : 0;
 }
 
 /* ------------------------------------------------------------------ */
@@ -2156,7 +2177,7 @@ static int sdr_process_args(int argc, char *argv[])
         rc=copy_passthrough(&sr,fout,in_frames,rec.num_channels,out_ch,
                             src_idx,label);
     }
-    if(rc!=0) goto write_error;
+    if(rc<0) goto write_error;
 
     /* ── Finalise WAV headers ── */
     if(out_fmt==FMT_SDRUNO||out_fmt==FMT_SDRCONNECT||
@@ -2165,6 +2186,10 @@ static int sdr_process_args(int argc, char *argv[])
     }
 
     seq_close(&sr); fclose(fout); free(fir_h);
+    if(rc==2){
+        proc_log("Cancelled. Partial output: %s\n",outpath);
+        return 2;
+    }
     proc_log("Done. Output: %s\n",outpath);
     return 0;
 
@@ -2189,9 +2214,17 @@ write_error:
 /* ------------------------------------------------------------------ */
 #define CLR_HEADER_BG   RGB(45,  45,  48)
 #define CLR_HEADER_TEXT RGB(240, 240, 240)
-#define CLR_RUN_BG      RGB(0,   120, 215)
-#define CLR_RUN_HOT     RGB(0,   102, 180)
+#define CLR_RUN_BG      RGB(0,   158, 87 )   /* green  — idle, click to Run */
+#define CLR_RUN_HOT     RGB(0,   134, 74 )
+#define CLR_PAUSE_BG    RGB(217, 119, 6  )   /* amber  — running, click to Pause */
+#define CLR_PAUSE_HOT   RGB(184, 101, 5  )
+#define CLR_RESUME_BG   RGB(0,   120, 215)   /* blue   — paused, click to Resume */
+#define CLR_RESUME_HOT  RGB(0,   102, 180)
 #define CLR_RUN_TEXT    RGB(255, 255, 255)
+#define CLR_CANCEL_BG       RGB(196, 43,  43 )   /* red — enabled */
+#define CLR_CANCEL_HOT      RGB(165, 32,  32 )
+#define CLR_CANCEL_DIS_BG   RGB(229, 229, 229)   /* grey — disabled */
+#define CLR_CANCEL_DIS_TEXT RGB(160, 160, 160)
 #define CLR_BG          RGB(245, 245, 245)
 #define CLR_SEG_ON      RGB(0,   180,   0)
 #define CLR_SEG_OFF     RGB(220, 220, 220)
@@ -2223,6 +2256,7 @@ static BOOL      g_batch_run  = FALSE;
 static HANDLE    g_thread     = NULL;
 static HANDLE    g_hprocess   = NULL;
 static volatile BOOL g_cancel = FALSE;  /* set to TRUE to abort processing thread */
+static volatile BOOL g_pause  = FALSE;  /* set to TRUE to suspend processing thread */
 static int       g_progress   = 0;
 static int       g_header_h   = 52;
 static HBRUSH    g_hbr_bg     = NULL;
@@ -2380,12 +2414,20 @@ static BOOL probe_file(const wchar_t *path,FileInfo *fi)
         }
         fi->year=0; fi->mon=0; fi->day=0;
         const wchar_t *bn=wcsrchr(path,L'\\'); if(!bn)bn=path; else bn++;
-        /* Linrad filename: yyyymmdd_hhmmssU_xxxkHz.raw */
+        /* Linrad filename: yyyymmdd_hhmmssU_xxxkHz.raw — the date/time block
+         * may be preceded by a custom prefix (e.g. "RSPduo_dual_tuner_"), so
+         * scan for the first occurrence of 8 digits + '_' + 6 digits rather
+         * than assuming it starts at the beginning of the filename. */
         int yy=0,mo=0,dd=0,hh=0,mi=0,ss=0;
-        if(swscanf(bn,L"%4d%2d%2d_%2d%2d%2d",&yy,&mo,&dd,&hh,&mi,&ss)==6
-           && yy>2000 && mo>=1 && mo<=12 && dd>=1 && dd<=31){
-            fi->year=yy; fi->mon=mo; fi->day=dd;
-            fi->hour=hh; fi->min=mi; fi->sec=ss;
+        for(const wchar_t *p=bn; *p; p++){
+            if(swscanf(p,L"%4d%2d%2d_%2d%2d%2d",&yy,&mo,&dd,&hh,&mi,&ss)==6
+               && yy>2000 && mo>=1 && mo<=12 && dd>=1 && dd<=31
+               && hh>=0 && hh<24 && mi>=0 && mi<60 && ss>=0 && ss<60){
+                fi->year=yy; fi->mon=mo; fi->day=dd;
+                fi->hour=hh; fi->min=mi; fi->sec=ss;
+                bn=p; /* anchor utc_digit lookup to the matched date block */
+                break;
+            }
         }
         if(wcslen(bn)>16){ wchar_t uc=bn[15]; fi->utc_digit=(uc>=L'0'&&uc<=L'9')?(int)(uc-L'0'):0; }
         return TRUE;
@@ -2841,8 +2883,11 @@ static void update_format_controls(void)
         EnableWindow(GetDlgItem(g_hwnd,ID_FMT_PERSEUS), FALSE);
     }
 
-    /* Perseus: DDC not supported (SDR Console hardcodes sample rate,
-     * ignoring nSamplesPerSec in fmt chunk after decimation). */
+    /* Perseus: DDC not supported. 1,999,000 Hz has 1999 as a prime factor,
+     * so every possible decimation produces a non-round output rate
+     * (e.g. 199,900 Hz). Testing shows this causes frequency/speed errors
+     * even in HDSDR (860.000 kHz measured as 860.430 kHz), not just SDR
+     * Console. Disabled until tested with other Perseus sample rates. */
     if(fi.fmt==4){
         if(IsDlgButtonChecked(g_hwnd,ID_DDC_CHECK)){
             CheckDlgButton(g_hwnd,ID_DDC_CHECK,BST_UNCHECKED);
@@ -3014,6 +3059,8 @@ static DWORD WINAPI run_thread(LPVOID param)
         _snwprintf(done,128,L"Processing failed.\r\n");
     else if(ec==0)
         _snwprintf(done,128,L"Completed successfully.\r\n");
+    else if(ec==2)
+        _snwprintf(done,128,L"Cancelled.\r\n");
     else
         _snwprintf(done,128,L"Failed (exit code %lu).\r\n",ec);
     PostMessageW(g_hwnd,WM_APPENDLOG,0,(LPARAM)_wcsdup(done));
@@ -3028,6 +3075,11 @@ static DWORD WINAPI batch_thread(LPVOID param)
 {
     (void)param;
     for(int i=0;i<g_job_count;i++){
+        if(!g_batch_run){
+            /* Batch was cancelled before this job started */
+            PostMessageW(g_hwnd,WM_BATCHSTATUS,(WPARAM)i,(LPARAM)_wcsdup(L"Cancelled"));
+            continue;
+        }
         g_cancel=FALSE;
         /* Skip if already cancelled */
         if(wcscmp(g_jobs[i].status,L"Cancelled")==0) continue;
@@ -3046,14 +3098,21 @@ static DWORD WINAPI batch_thread(LPVOID param)
 
         DWORD ec=run_one_job(g_jobs[i].cmdline);
 
-        /* If cancelled mid-job g_hprocess was terminated, ec will be non-zero */
-        if(ec==(DWORD)-1 || ec!=0){
-            /* Check if user cancelled — g_hprocess cleared on termination */
+        if(ec==2){
+            /* Job itself was cancelled mid-copy */
+            PostMessageW(g_hwnd,WM_BATCHSTATUS,(WPARAM)i,(LPARAM)_wcsdup(L"Cancelled"));
+            /* Cancel any remaining pending jobs too */
+            for(int j=i+1;j<g_job_count;j++)
+                if(wcscmp(g_jobs[j].status,L"Pending")==0)
+                    PostMessageW(g_hwnd,WM_BATCHSTATUS,(WPARAM)j,(LPARAM)_wcsdup(L"Cancelled"));
+            wchar_t done2[64];
+            _snwprintf(done2,64,L"Job %d cancelled.\r\n\r\n",i+1);
+            PostMessageW(g_hwnd,WM_APPENDLOG,0,(LPARAM)_wcsdup(done2));
+            break;
+        } else if(ec==(DWORD)-1 || ec!=0){
             const wchar_t *st=L"Failed";
-            /* If the batch itself was cancelled, mark remaining jobs */
             if(!g_batch_run){
                 PostMessageW(g_hwnd,WM_BATCHSTATUS,(WPARAM)i,(LPARAM)_wcsdup(L"Cancelled"));
-                /* Cancel pending jobs */
                 for(int j=i+1;j<g_job_count;j++)
                     if(wcscmp(g_jobs[j].status,L"Pending")==0)
                         PostMessageW(g_hwnd,WM_BATCHSTATUS,(WPARAM)j,(LPARAM)_wcsdup(L"Cancelled"));
@@ -3117,7 +3176,12 @@ static void draw_progress_bar(DRAWITEMSTRUCT *di)
 static void draw_run_button(DRAWITEMSTRUCT *di)
 {
     BOOL pressed=(di->itemState&ODS_SELECTED)!=0;
-    COLORREF bg=pressed?CLR_RUN_HOT:CLR_RUN_BG;
+    COLORREF bg_normal, bg_hot;
+    const wchar_t *label;
+    if(!g_running)      { bg_normal=CLR_RUN_BG;    bg_hot=CLR_RUN_HOT;    label=L"Run";    }
+    else if(g_pause)    { bg_normal=CLR_RESUME_BG; bg_hot=CLR_RESUME_HOT; label=L"Resume"; }
+    else                { bg_normal=CLR_PAUSE_BG;  bg_hot=CLR_PAUSE_HOT;  label=L"Pause";  }
+    COLORREF bg=pressed?bg_hot:bg_normal;
     HBRUSH hbr=CreateSolidBrush(bg);
     FillRect(di->hDC,&di->rcItem,hbr); DeleteObject(hbr);
     HPEN hp=CreatePen(PS_SOLID,1,RGB(0,84,153));
@@ -3129,7 +3193,29 @@ static void draw_run_button(DRAWITEMSTRUCT *di)
     SetBkMode(di->hDC,TRANSPARENT);
     SetTextColor(di->hDC,CLR_RUN_TEXT);
     if(g_font_bold) SelectObject(di->hDC,g_font_bold);
-    DrawTextW(di->hDC,L"Run",-1,&di->rcItem,DT_CENTER|DT_VCENTER|DT_SINGLELINE);
+    DrawTextW(di->hDC,label,-1,&di->rcItem,DT_CENTER|DT_VCENTER|DT_SINGLELINE);
+    if(di->itemState&ODS_FOCUS){ RECT fr=di->rcItem; InflateRect(&fr,-3,-3); DrawFocusRect(di->hDC,&fr); }
+}
+
+static void draw_cancel_button(DRAWITEMSTRUCT *di)
+{
+    BOOL pressed  = (di->itemState&ODS_SELECTED)!=0;
+    BOOL disabled = (di->itemState&ODS_DISABLED)!=0;
+    COLORREF bg, txt;
+    if(disabled){ bg=CLR_CANCEL_DIS_BG; txt=CLR_CANCEL_DIS_TEXT; }
+    else        { bg=pressed?CLR_CANCEL_HOT:CLR_CANCEL_BG; txt=CLR_RUN_TEXT; }
+    HBRUSH hbr=CreateSolidBrush(bg);
+    FillRect(di->hDC,&di->rcItem,hbr); DeleteObject(hbr);
+    HPEN hp=CreatePen(PS_SOLID,1,disabled?RGB(180,180,180):RGB(120,24,24));
+    HPEN op=(HPEN)SelectObject(di->hDC,hp);
+    HBRUSH ob=(HBRUSH)SelectObject(di->hDC,GetStockObject(NULL_BRUSH));
+    RECT r=di->rcItem; r.right--; r.bottom--;
+    Rectangle(di->hDC,r.left,r.top,r.right,r.bottom);
+    SelectObject(di->hDC,op); SelectObject(di->hDC,ob); DeleteObject(hp);
+    SetBkMode(di->hDC,TRANSPARENT);
+    SetTextColor(di->hDC,txt);
+    if(g_font_bold) SelectObject(di->hDC,g_font_bold);
+    DrawTextW(di->hDC,L"Cancel",-1,&di->rcItem,DT_CENTER|DT_VCENTER|DT_SINGLELINE);
     if(di->itemState&ODS_FOCUS){ RECT fr=di->rcItem; InflateRect(&fr,-3,-3); DrawFocusRect(di->hDC,&fr); }
 }
 
@@ -3238,6 +3324,7 @@ static void create_controls(HWND hwnd)
         M+10,y+74,W-M*2-72,52,hwnd,(HMENU)(UINT_PTR)ID_SEQ_LIST,g_hinst,NULL);
       SendMessageW(hl,WM_SETFONT,(WPARAM)g_font_mono,FALSE); }
     mk_btn(hwnd,ID_SEQ_REMOVE,L"Remove",W-M-60,y+74,58,24,BS_PUSHBUTTON);
+    EnableWindow(GetDlgItem(hwnd,ID_SEQ_REMOVE),FALSE);
     y+=148;
 
     /* ── Mode ── */
@@ -3309,7 +3396,7 @@ static void create_controls(HWND hwnd)
 
     /* ── Buttons row ── */
     mk_btn(hwnd,ID_RUN,    L"Run",       W-M-256,y,78,28,BS_OWNERDRAW);
-    mk_btn(hwnd,ID_CANCEL, L"Cancel",    W-M-170,y,78,28,BS_PUSHBUTTON);
+    mk_btn(hwnd,ID_CANCEL, L"Cancel",    W-M-170,y,78,28,BS_OWNERDRAW);
     mk_btn(hwnd,ID_CLEAR,  L"Clear Log", W-M-84, y,78,28,BS_PUSHBUTTON);
     y+=38;
 
@@ -3383,6 +3470,7 @@ static void browse_file(void)
         /* Clear sequence list when new primary file selected */
         g_seq_count=0;
         SendDlgItemMessageW(g_hwnd,ID_SEQ_LIST,LB_RESETCONTENT,0,0);
+        EnableWindow(GetDlgItem(g_hwnd,ID_SEQ_REMOVE),FALSE);
         update_channel_controls();
         update_format_controls();
         update_prediction();
@@ -3495,13 +3583,15 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp)
         return (LRESULT)g_hbr_bg;}
 
     case WM_CTLCOLORBTN:
-        if((HWND)lp==GetDlgItem(hwnd,ID_RUN)) return (LRESULT)NULL;
+        if((HWND)lp==GetDlgItem(hwnd,ID_RUN))    return (LRESULT)NULL;
+        if((HWND)lp==GetDlgItem(hwnd,ID_CANCEL)) return (LRESULT)NULL;
         SetBkColor((HDC)wp,CLR_BG);
         return (LRESULT)g_hbr_bg;
 
     case WM_DRAWITEM:{
         DRAWITEMSTRUCT *di=(DRAWITEMSTRUCT*)lp;
         if(di->CtlID==ID_RUN)     { draw_run_button(di);   return TRUE; }
+        if(di->CtlID==ID_CANCEL)  { draw_cancel_button(di);return TRUE; }
         if(di->CtlID==ID_PROGRESS){ draw_progress_bar(di); return TRUE; }
         if(di->CtlID==ID_HEADER_PANEL){
             FillRect(di->hDC,&di->rcItem,g_hbr_header);
@@ -3509,7 +3599,7 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp)
             SetTextColor(di->hDC,CLR_HEADER_TEXT);
             if(g_font_title) SelectObject(di->hDC,g_font_title);
             RECT tr=di->rcItem; tr.left+=14;
-            DrawTextW(di->hDC,L"SDR Trim  v1.5.1",-1,&tr,DT_LEFT|DT_VCENTER|DT_SINGLELINE);
+            DrawTextW(di->hDC,L"SDR Trim  v1.5.2",-1,&tr,DT_LEFT|DT_VCENTER|DT_SINGLELINE);
             /* Name on right — use normal font, slightly smaller */
             if(g_font) SelectObject(di->hDC,g_font);
             RECT nr=di->rcItem; nr.right-=14;
@@ -3555,6 +3645,7 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp)
                 /* Add short filename to listbox */
                 const wchar_t *fn=wcsrchr(buf,L'\\'); fn=fn?fn+1:buf;
                 SendDlgItemMessageW(hwnd,ID_SEQ_LIST,LB_ADDSTRING,0,(LPARAM)fn);
+                EnableWindow(GetDlgItem(hwnd,ID_SEQ_REMOVE),TRUE);
                 update_channel_controls();
                 update_prediction();
             }
@@ -3569,6 +3660,8 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp)
             for(int i=sel;i<g_seq_count-1;i++)
                 wcsncpy(g_seq_paths[i],g_seq_paths[i+1],MAX_PATH-1);
             g_seq_count--;
+            if(g_seq_count==0)
+                EnableWindow(GetDlgItem(hwnd,ID_SEQ_REMOVE),FALSE);
             update_channel_controls();
             update_prediction();
             break;
@@ -3606,7 +3699,13 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp)
             if(HIWORD(wp)==EN_CHANGE){ update_channel_controls(); update_format_controls(); populate_bw_dropdown(hwnd,g_sample_rate); update_prediction(); } break;
 
         case ID_RUN:
-            if(g_running) break;
+            if(g_running){
+                /* Job already running — this click toggles pause/resume */
+                g_pause = !g_pause;
+                log_append(g_pause ? L"Paused.\r\n" : L"Resumed.\r\n");
+                InvalidateRect(GetDlgItem(hwnd,ID_RUN),NULL,FALSE);
+                break;
+            }
             {
                 wchar_t input[MAX_PATH];
                 GetWindowTextW(GetDlgItem(hwnd,ID_INPUT_EDIT),input,MAX_PATH);
@@ -3631,15 +3730,19 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp)
                 log_append(hdr);
                 g_running=TRUE;
                 g_batch_run=FALSE;
-                EnableWindow(GetDlgItem(hwnd,ID_RUN),FALSE);
+                g_pause=FALSE;
+                InvalidateRect(GetDlgItem(hwnd,ID_RUN),NULL,FALSE);
                 EnableWindow(GetDlgItem(hwnd,ID_CANCEL),TRUE);
+                InvalidateRect(GetDlgItem(hwnd,ID_CANCEL),NULL,FALSE);
                 SetWindowTextW(GetDlgItem(hwnd,ID_PCT_STATIC),L"");
                 SetWindowTextW(GetDlgItem(hwnd,ID_ETA_STATIC),L"");
                 g_thread=CreateThread(NULL,0,run_thread,args,0,NULL);
                 if(!g_thread){
                     g_running=FALSE;
-                    EnableWindow(GetDlgItem(hwnd,ID_RUN),TRUE);
+                    g_pause=FALSE;
+                    InvalidateRect(GetDlgItem(hwnd,ID_RUN),NULL,FALSE);
                     EnableWindow(GetDlgItem(hwnd,ID_CANCEL),FALSE);
+                    InvalidateRect(GetDlgItem(hwnd,ID_CANCEL),NULL,FALSE);
                     free(args);
                 }
             }
@@ -3648,14 +3751,16 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp)
         case ID_CANCEL:
             if(g_running&&g_thread){
                 g_cancel=TRUE;
+                g_pause=FALSE;
                 g_batch_run=FALSE;
-                /* Give thread 500ms to notice g_cancel, then force-terminate */
-                if(WaitForSingleObject(g_thread,500)!=WAIT_OBJECT_0)
-                    TerminateThread(g_thread,1);
-                log_append(L"Cancelled by user.\r\n");
-                g_running=FALSE;
-                EnableWindow(GetDlgItem(hwnd,ID_RUN),TRUE);
                 EnableWindow(GetDlgItem(hwnd,ID_CANCEL),FALSE);
+                InvalidateRect(GetDlgItem(hwnd,ID_CANCEL),NULL,FALSE);
+                log_append(L"Cancelling — waiting for current operation to stop...\r\n");
+                /* Cooperative cancel only — never force-terminate the thread.
+                 * TerminateThread can corrupt the CRT heap lock, causing the
+                 * next file operation (even in a different job) to hang forever.
+                 * The copy loops check g_cancel and will return within one
+                 * read-block (well under a second for typical block sizes). */
             }
             break;
 
@@ -3731,9 +3836,11 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp)
                 g_progress=0; InvalidateRect(GetDlgItem(hwnd,ID_PROGRESS),NULL,FALSE);
                 g_running=TRUE;
                 g_batch_run=TRUE;
-                EnableWindow(GetDlgItem(hwnd,ID_RUN),FALSE);
+                g_pause=FALSE;
+                InvalidateRect(GetDlgItem(hwnd,ID_RUN),NULL,FALSE);
                 EnableWindow(GetDlgItem(hwnd,ID_RUN_BATCH),FALSE);
                 EnableWindow(GetDlgItem(hwnd,ID_CANCEL),TRUE);
+                InvalidateRect(GetDlgItem(hwnd,ID_CANCEL),NULL,FALSE);
                 SetWindowTextW(GetDlgItem(hwnd,ID_PCT_STATIC),L"");
                 SetWindowTextW(GetDlgItem(hwnd,ID_ETA_STATIC),L"");
                 g_thread=CreateThread(NULL,0,batch_thread,NULL,0,NULL);
@@ -3816,9 +3923,10 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp)
     case WM_APPENDLOG:
         if(wp==0&&lp){ log_append((wchar_t*)lp); free((void*)lp); }
         else if(wp==1){
-            g_running=FALSE; g_hprocess=NULL;
+            g_running=FALSE; g_pause=FALSE; g_hprocess=NULL;
             EnableWindow(GetDlgItem(hwnd,ID_RUN),TRUE);
             EnableWindow(GetDlgItem(hwnd,ID_CANCEL),FALSE);
+            InvalidateRect(GetDlgItem(hwnd,ID_CANCEL),NULL,FALSE);
             SetWindowTextW(GetDlgItem(hwnd,ID_ETA_STATIC),L"");
             DWORD ec=(DWORD)(ULONG_PTR)lp;
             g_progress=(ec==0?100:0);
@@ -3849,9 +3957,10 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp)
             return r;
         }
     case WM_BATCHDONE:
-        g_running=FALSE; g_batch_run=FALSE; g_hprocess=NULL;
+        g_running=FALSE; g_pause=FALSE; g_batch_run=FALSE; g_hprocess=NULL;
         EnableWindow(GetDlgItem(hwnd,ID_RUN),TRUE);
         EnableWindow(GetDlgItem(hwnd,ID_CANCEL),FALSE);
+        InvalidateRect(GetDlgItem(hwnd,ID_CANCEL),NULL,FALSE);
         update_run_batch_button();
         SetWindowTextW(GetDlgItem(hwnd,ID_ETA_STATIC),L"");
         log_append(L"Batch complete.\r\n");
