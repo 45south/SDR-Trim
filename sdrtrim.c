@@ -3987,10 +3987,19 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp)
         switch(LOWORD(wp)){
         case ID_BROWSE: browse_file(); break;
         case ID_OUTFOLDER_BROWSE: browse_folder(); break;
-        case ID_OUTFOLDER_CLEAR:
+        case ID_OUTFOLDER_CLEAR:{
             g_out_folder[0]=L'\0';
-            SetWindowTextW(GetDlgItem(hwnd,ID_OUTFOLDER_EDIT),L"");
-            update_prediction(); break;
+            /* Show the input file's folder as a visual hint */
+            wchar_t inp_cf[MAX_PATH];
+            GetWindowTextW(GetDlgItem(hwnd,ID_INPUT_EDIT),inp_cf,MAX_PATH);
+            wchar_t disp[MAX_PATH]=L"";
+            if(inp_cf[0]){
+                wcsncpy(disp,inp_cf,MAX_PATH-1);
+                wchar_t *sl=wcsrchr(disp,L'\\');
+                if(sl) sl[0]=L'\0'; else disp[0]=L'\0';
+            }
+            SetWindowTextW(GetDlgItem(hwnd,ID_OUTFOLDER_EDIT),disp);
+            update_prediction(); break;}
 
         case ID_SEQ_ADD:{
             if(g_seq_count >= SEQ_MAX){
@@ -4095,9 +4104,42 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp)
             populate_bw_dropdown(hwnd, g_sample_rate, efmt);
         }
             update_format_controls(); update_prediction(); break;}
+        case ID_OUTFOLDER_EDIT:
+            if(HIWORD(wp)==EN_CHANGE){
+                wchar_t typed[MAX_PATH];
+                GetWindowTextW(GetDlgItem(hwnd,ID_OUTFOLDER_EDIT),typed,MAX_PATH);
+                /* If field is empty or matches the input file folder, use default */
+                wchar_t inp_fe[MAX_PATH];
+                GetWindowTextW(GetDlgItem(hwnd,ID_INPUT_EDIT),inp_fe,MAX_PATH);
+                wchar_t inp_dir[MAX_PATH]=L"";
+                if(inp_fe[0]){
+                    wcsncpy(inp_dir,inp_fe,MAX_PATH-1);
+                    wchar_t *sl2=wcsrchr(inp_dir,L'\\');
+                    if(sl2) sl2[0]=L'\0'; else inp_dir[0]=L'\0';
+                }
+                if(typed[0]==L'\0' || _wcsicmp(typed,inp_dir)==0)
+                    g_out_folder[0]=L'\0';
+                else
+                    wcsncpy(g_out_folder,typed,MAX_PATH-1);
+                update_prediction();
+            } break;
         case ID_DDC_CENTRE:
         case ID_START_EDIT: case ID_END_EDIT: case ID_INPUT_EDIT:
-            if(HIWORD(wp)==EN_CHANGE){ update_channel_controls(); update_format_controls(); update_prediction(); } break;
+            if(HIWORD(wp)==EN_CHANGE){
+                update_channel_controls(); update_format_controls(); update_prediction();
+                /* Refresh folder hint if using default (same as input) */
+                if(g_out_folder[0]==L'\0'){
+                    wchar_t inp_up[MAX_PATH];
+                    GetWindowTextW(GetDlgItem(hwnd,ID_INPUT_EDIT),inp_up,MAX_PATH);
+                    wchar_t dir_up[MAX_PATH]=L"";
+                    if(inp_up[0]){
+                        wcsncpy(dir_up,inp_up,MAX_PATH-1);
+                        wchar_t *sl3=wcsrchr(dir_up,L'\\');
+                        if(sl3) sl3[0]=L'\0'; else dir_up[0]=L'\0';
+                    }
+                    SetWindowTextW(GetDlgItem(hwnd,ID_OUTFOLDER_EDIT),dir_up);
+                }
+            } break;
 
         case ID_RUN:
             if(g_running){
