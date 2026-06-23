@@ -18,6 +18,7 @@
 #define WIN32_LEAN_AND_MEAN
 #define _WIN32_WINNT 0x0601
 #include <windows.h>
+#include <shlobj.h>
 #include <shellapi.h>
 #include <commdlg.h>
 #include <commctrl.h>
@@ -47,6 +48,12 @@
 #define ID_FMT_SDRCONNECT   114
 #define ID_FMT_PERSEUS      140
 #define ID_FMT_JAGUAR       141
+#define ID_OUT_16BIT        142
+#define ID_OUT_24BIT        143
+#define ID_BIT_LABEL        144
+#define ID_OUTFOLDER_EDIT   145
+#define ID_OUTFOLDER_BROWSE 146
+#define ID_OUTFOLDER_CLEAR  147
 #define ID_DDC_CHECK        115
 #define ID_DDC_CENTRE       116
 #define ID_DDC_BW           117
@@ -63,6 +70,7 @@
 #define SEQ_MAX             16   /* max files in sequence */
 #define ID_SEQ_LIST         134
 #define ID_SEQ_REMOVE       135
+#define ID_DDC_UNAVAIL      136
 #define ID_PCT_STATIC       125
 #define ID_ETA_STATIC       126
 /* Batch */
@@ -232,6 +240,7 @@ typedef struct {
     int         sample_rate;        /* Hz                               */
     int         centre_freq_hz;     /* Hz                               */
     int         num_channels;       /* 2 (single) or 4 (dual)           */
+    int         bits_per_sample;    /* 16 or 24 (Perseus lower rates)   */
     int64_t     epoch;              /* Unix timestamp of recording start */
     int         year, month, day;
     int         hour, minute, second;
@@ -610,9 +619,10 @@ static int detect_input(const char *path, RecInfo *r, FILE *fp,
             if(fread(&fmt_sz,4,1,fp)!=1)return 0;
             FmtChunk fmt;
             if(fread(&fmt,sizeof(fmt),1,fp)!=1)return 0;
-            r->sample_rate  = (int)fmt.sample_rate;
-            r->num_channels = (int)fmt.num_channels;
-            r->tuner        = (r->num_channels==4)?TUNER_DUAL:TUNER_SINGLE;
+            r->sample_rate      = (int)fmt.sample_rate;
+            r->num_channels     = (int)fmt.num_channels;
+            r->bits_per_sample  = (int)fmt.bits_per_sample;
+            r->tuner            = (r->num_channels==4)?TUNER_DUAL:TUNER_SINGLE;
             /* data chunk */
             int64_t data_off=fmt_off+8+(int64_t)fmt_sz;
             file_seek(fp,data_off,SEEK_SET);
@@ -652,9 +662,10 @@ static int detect_input(const char *path, RecInfo *r, FILE *fp,
             if(fread(&fmt_sz,4,1,fp)!=1)return 0;
             FmtChunk fmt;
             if(fread(&fmt,sizeof(fmt),1,fp)!=1)return 0;
-            r->sample_rate  = (int)fmt.sample_rate;
-            r->num_channels = (int)fmt.num_channels;
-            r->tuner        = (r->num_channels==4)?TUNER_DUAL:TUNER_SINGLE;
+            r->sample_rate      = (int)fmt.sample_rate;
+            r->num_channels     = (int)fmt.num_channels;
+            r->bits_per_sample  = (int)fmt.bits_per_sample;
+            r->tuner            = (r->num_channels==4)?TUNER_DUAL:TUNER_SINGLE;
             /* Skip any fmt extension bytes */
             if(fmt_sz>sizeof(fmt))
                 file_seek(fp,(int64_t)(fmt_sz-sizeof(fmt)),SEEK_CUR);
@@ -748,8 +759,9 @@ static int detect_input(const char *path, RecInfo *r, FILE *fp,
             if(cid[0]=='f'&&cid[1]=='m'&&cid[2]=='t'&&cid[3]==' '){
                 FmtChunk fmt;
                 if(fread(&fmt,sizeof(fmt),1,fp)!=1) break;
-                r->sample_rate=(int)fmt.sample_rate;
-                r->num_channels=(int)fmt.num_channels;
+                r->sample_rate     =(int)fmt.sample_rate;
+                r->num_channels    =(int)fmt.num_channels;
+                r->bits_per_sample =(int)fmt.bits_per_sample;
                 r->tuner=(r->num_channels==4)?TUNER_DUAL:TUNER_SINGLE;
                 if(csz>sizeof(fmt)) file_seek(fp,(int64_t)(csz-sizeof(fmt)),SEEK_CUR);
             } else if(cid[0]=='a'&&cid[1]=='u'&&cid[2]=='x'&&cid[3]=='i'){
@@ -903,14 +915,14 @@ static void patch_rf64(FILE *fp,int64_t ds64_pos,int64_t data_sz32_pos,
     uint32_t neg1=0xFFFFFFFF; fwrite(&neg1,4,1,fp);
 }
 
-static void write_fmt_pcm(FILE *fp,uint32_t sr,uint16_t ch)
+static void write_fmt_pcm(FILE *fp,uint32_t sr,uint16_t ch,uint16_t bps)
 {
     fwrite("fmt ",1,4,fp);
     uint32_t sz=16; fwrite(&sz,4,1,fp);
     FmtChunk fmt;
     fmt.audio_format=0x0001; fmt.num_channels=ch;
-    fmt.sample_rate=sr; fmt.bits_per_sample=16;
-    fmt.block_align=(uint16_t)(ch*2);
+    fmt.sample_rate=sr; fmt.bits_per_sample=bps;
+    fmt.block_align=(uint16_t)(ch*(bps/8));
     fmt.byte_rate=sr*fmt.block_align;
     fwrite(&fmt,sizeof(fmt),1,fp);
 }
@@ -956,11 +968,11 @@ static int64_t write_wav_header(FILE *fp,
     FileFormat out_fmt,
     uint64_t out_data_bytes,
     uint32_t sample_rate, uint16_t channels,
+    uint16_t bits_per_sample,
     int32_t cf_hz,
     int sy,int sm,int sd,int sh,int smin,int ssec,
     int ey,int em,int ed,int eh,int emin,int esec,
     const char *outpath,
-    const RcvrChunk *rcvr_in,
     int *use_rf64_out, int64_t *ds64_pos_out)
 {
     /* Compute total header overhead:
@@ -995,18 +1007,31 @@ static int64_t write_wav_header(FILE *fp,
         write_junk(fp);
     }
 
-    write_fmt_pcm(fp,sample_rate,channels);
+    write_fmt_pcm(fp,sample_rate,channels,bits_per_sample);
 
     if(out_fmt==FMT_SDRUNO){
         write_auxi(fp,cf_hz,sy,sm,sd,sh,smin,ssec,ey,em,ed,eh,emin,esec,outpath);
     }
     if(out_fmt==FMT_PERSEUS||out_fmt==FMT_JAGUAR){
-        /* Write rcvr chunk — preserve original padding, update key fields */
+        /* Build rcvr chunk. flags field encodes the sample rate index:
+         *   0=125k, 1=250k, 2=500k, 3=1000k, 4=2000k (16-bit), 5=Jaguar
+         * rcvr+12 (0x00010000=65536) and rcvr+16 (0x00000101=257) are
+         * constant across all native Perseus rates and must be set. */
         RcvrChunk rc; memset(&rc,0,sizeof(rc));
-        if(rcvr_in) rc = *rcvr_in;   /* start from original */
         rc.centre_freq_hz  = (uint32_t)cf_hz;
-        rc.flags           = (out_fmt==FMT_JAGUAR) ? 5 : 4;
+        if(out_fmt==FMT_JAGUAR){
+            rc.flags = 5;
+        } else {
+            /* Map sample rate to Perseus rate index */
+            rc.flags = (sample_rate<=125000)?0:
+                       (sample_rate<=250000)?1:
+                       (sample_rate<=500000)?2:
+                       (sample_rate<=1000000)?3:4;
+        }
         rc.unix_timestamp  = (uint32_t)utc_to_unix(sy,sm,sd,sh,smin,ssec);
+        /* Set constant fields present in all native Perseus files */
+        rc.padding[2] = 0x01;                          /* rcvr+12 = 0x00010000 */
+        rc.padding[4] = 0x01; rc.padding[5] = 0x01;   /* rcvr+16 = 0x00000101 */
         fwrite("rcvr",1,4,fp);
         uint32_t rcvr_sz=sizeof(RcvrChunk);
         fwrite(&rcvr_sz,4,1,fp);
@@ -1025,11 +1050,11 @@ static int64_t write_wav_header(FILE *fp,
 
 static void finalise_wav(FILE *fp,int use_rf64,
                           int64_t ds64_pos,int64_t data_sz32_pos,
-                          int out_ch_count)
+                          int out_ch_count, int out_bps)
 {
     int64_t total=file_tell(fp);
     uint64_t actual_data=(uint64_t)(total-(data_sz32_pos+4));
-    uint64_t actual_frames=actual_data/((uint64_t)out_ch_count*2);
+    uint64_t actual_frames=actual_data/((uint64_t)out_ch_count*(uint64_t)out_bps);
 
     if(use_rf64){
         patch_rf64(fp,ds64_pos,data_sz32_pos,
@@ -1149,12 +1174,15 @@ typedef struct {
     int64_t  data_offset;   /* byte offset to data in current file */
     int      in_ch;         /* channels per frame */
     int      sample_rate;   /* samples per second */
+    int      bytes_per_samp;/* 2=int16, 3=int24 */
 } SeqReader;
 
 /* Read exactly n_frames frames from the sequence, spanning files as needed.
+ * For 24-bit input, converts each sample to 16-bit (top 16 of 24 bits).
  * Returns number of frames actually read (may be < n_frames at end of sequence). */
 static size_t seq_read_frames(SeqReader *sr, int16_t *buf, size_t n_frames)
 {
+    int bps = (sr->bytes_per_samp > 0) ? sr->bytes_per_samp : 2;
     size_t total = 0;
     while(total < n_frames && sr->cur < sr->count){
         if(!sr->fp){
@@ -1163,13 +1191,32 @@ static size_t seq_read_frames(SeqReader *sr, int16_t *buf, size_t n_frames)
             file_seek(sr->fp, sr->data_offset, SEEK_SET);
         }
         size_t want = n_frames - total;
-        size_t got  = fread(buf + total*(size_t)sr->in_ch,
-                            sizeof(int16_t), want*(size_t)sr->in_ch, sr->fp);
-        size_t gf   = got / (size_t)sr->in_ch;
-        total += gf;
-        if(gf < want){
-            /* Exhausted this file — move to next */
-            fclose(sr->fp); sr->fp=NULL; sr->cur++;
+        int    spf  = sr->in_ch;   /* samples per frame */
+        if(bps == 2){
+            size_t got = fread(buf + total*(size_t)spf,
+                               sizeof(int16_t), want*(size_t)spf, sr->fp);
+            size_t gf  = got / (size_t)spf;
+            total += gf;
+            if(gf < want){ fclose(sr->fp); sr->fp=NULL; sr->cur++; }
+        } else {
+            /* 24-bit: read raw bytes then convert to int16 */
+            size_t  raw  = want*(size_t)spf*3;
+            uint8_t *tmp = (uint8_t*)malloc(raw);
+            if(!tmp) break;
+            size_t got_b = fread(tmp, 1, raw, sr->fp);
+            size_t got_s = got_b / 3;
+            size_t gf    = got_s / (size_t)spf;
+            int16_t *out = buf + total*(size_t)spf;
+            for(size_t s=0; s<got_s; s++){
+                int32_t v = (int32_t)((uint32_t)tmp[s*3]
+                           |((uint32_t)tmp[s*3+1]<<8)
+                           |((uint32_t)tmp[s*3+2]<<16));
+                if(v & 0x800000) v |= (int32_t)0xFF000000;
+                out[s] = (int16_t)(v >> 8);
+            }
+            free(tmp);
+            total += gf;
+            if(gf < want){ fclose(sr->fp); sr->fp=NULL; sr->cur++; }
         }
     }
     return total;
@@ -1191,7 +1238,8 @@ static int seq_seek_frame(SeqReader *sr, uint64_t frame,
             sr->cur = i;
             sr->fp  = _wfopen(sr->paths[i],L"rb");
             if(!sr->fp) return -1;
-            int64_t byte_off = sr->data_offset + (int64_t)(frame-acc)*(int64_t)sr->in_ch*2;
+            int bps2 = (sr->bytes_per_samp>0) ? sr->bytes_per_samp : 2;
+            int64_t byte_off = sr->data_offset + (int64_t)(frame-acc)*(int64_t)sr->in_ch*(int64_t)bps2;
             file_seek(sr->fp, byte_off, SEEK_SET);
             return 0;
         }
@@ -1211,9 +1259,29 @@ static void wait_if_paused(void)
     }
 }
 
+/* Write n_samps int16 values to fp, converting to 24-bit if bps==24.
+ * Returns 0 on success, -1 on write error. */
+static int write_samples_bps(FILE *fp, const int16_t *buf, size_t n_samps, int bps)
+{
+    if(bps == 16){
+        if(fwrite(buf, sizeof(int16_t), n_samps, fp) != n_samps) return -1;
+    } else {
+        /* Expand int16 to 24-bit LE: shift left 8, fill low byte with 0 */
+        uint8_t tmp[3];
+        for(size_t i=0; i<n_samps; i++){
+            int32_t v = (int32_t)buf[i] << 8;
+            tmp[0] = (uint8_t)(v & 0xFF);
+            tmp[1] = (uint8_t)((v>>8) & 0xFF);
+            tmp[2] = (uint8_t)((v>>16) & 0xFF);
+            if(fwrite(tmp, 1, 3, fp) != 3) return -1;
+        }
+    }
+    return 0;
+}
+
 static int copy_ddc(SeqReader *sr, FILE *fout,
     uint64_t warmup_frames, uint64_t in_frames,
-    int in_ch, int out_ch,
+    int in_ch, int out_ch, int out_bps,
     const double *h, int n_taps, int D,
     double delta_phi, OutputChan ochan,
     const char *label)
@@ -1344,7 +1412,7 @@ static int copy_ddc(SeqReader *sr, FILE *fout,
 
         if(n_out>0){
             size_t samps=(size_t)n_out*(size_t)out_ch;
-            if(fwrite(obuf,sizeof(int16_t),samps,fout)!=samps){
+            if(write_samples_bps(fout,obuf,samps,out_bps)!=0){
                 proc_perror("\nfwrite");
                 free(hf);free(dly_aI);free(dly_aQ);free(dly_bI);free(dly_bQ);
                 free(ibuf);free(obuf); return -1;
@@ -1363,7 +1431,7 @@ static int copy_ddc(SeqReader *sr, FILE *fout,
 /*  Streaming copy (no DDC, no resampling)                             */
 /* ------------------------------------------------------------------ */
 static int copy_passthrough(SeqReader *sr, FILE *fout,
-    uint64_t total_frames, int in_ch, int out_ch,
+    uint64_t total_frames, int in_ch, int out_ch, int out_bps,
     int src_idx, /* 0=chA IQ, 2=chB IQ, -1=all channels */
     const char *label)
 {
@@ -1381,14 +1449,14 @@ static int copy_passthrough(SeqReader *sr, FILE *fout,
         size_t gf=seq_read_frames(sr,ibuf,batch);
         if(gf==0){ proc_log("\nWarning: source ended early.\n"); break; }
         if(src_idx<0){
-            if(fwrite(ibuf,sizeof(int16_t),gf*(size_t)in_ch,fout)!=gf*(size_t)in_ch){
+            if(write_samples_bps(fout,ibuf,gf*(size_t)in_ch,out_bps)!=0){
                 proc_perror("\nfwrite"); free(ibuf);free(obuf); return -1; }
         } else {
             for(size_t f=0;f<gf;f++){
                 obuf[f*2+0]=ibuf[f*in_ch+src_idx];
                 obuf[f*2+1]=ibuf[f*in_ch+src_idx+1];
             }
-            if(fwrite(obuf,sizeof(int16_t),gf*2,fout)!=gf*2){
+            if(write_samples_bps(fout,obuf,gf*2,out_bps)!=0){
                 proc_perror("\nfwrite"); free(ibuf);free(obuf); return -1; }
         }
         done+=(uint64_t)gf; left-=(uint64_t)gf;
@@ -1516,7 +1584,7 @@ static int resamp_process_block(Resampler *rs,
 }
 
 static int copy_resample(SeqReader *sr, FILE *fout,
-    uint64_t in_frames, int in_ch, int out_ch,
+    uint64_t in_frames, int in_ch, int out_ch, int out_bps,
     int fs_in, int fs_out,
     OutputChan ochan, const char *label)
 {
@@ -1575,7 +1643,7 @@ static int copy_resample(SeqReader *sr, FILE *fout,
 
         if(n_out>0){
             size_t samps=(size_t)n_out*out_ch;
-            if(fwrite(obuf,sizeof(int16_t),samps,fout)!=samps){
+            if(write_samples_bps(fout,obuf,samps,out_bps)!=0){
                 proc_perror("\nfwrite");
                 free(ibuf);free(mono);free(obuf);resamp_free(rs);return -1;
             }
@@ -1607,6 +1675,8 @@ static int sdr_process_args(int argc, char *argv[])
     int      ddc_freq_khz= 0;
     int      ddc_bw_khz  = 0;
     int      ochan_set   = 0;           /* user explicitly set ch1/ch2 */
+    int      out_bps_override = 0;      /* 0=auto, 16 or 24=forced via --24bit */
+    char     outdir_override[512]={0}; /* custom output directory via --outdir */
 
     /* Second arg: HHMMSS start time, --convert, or start of options (implicit full-file) */
     if(strcmp(argv[2],"--convert")==0){
@@ -1653,6 +1723,16 @@ static int sdr_process_args(int argc, char *argv[])
         if(strcmp(argv[i],"--ch1")==0){ ochan=OUT_CH1; ochan_set=1; }
         else if(strcmp(argv[i],"--ch2")==0){ ochan=OUT_CH2; ochan_set=1; }
         else if(strcmp(argv[i],"--seq")==0){ i++; /* handled later in SeqReader build */ }
+        else if(strcmp(argv[i],"--24bit")==0){ out_bps_override=24; }
+        else if(strcmp(argv[i],"--16bit")==0){ out_bps_override=16; }
+        else if(strcmp(argv[i],"--outdir")==0 && i+1<argc){
+            i++;
+            snprintf(outdir_override,sizeof(outdir_override),"%s",argv[i]);
+            /* Ensure trailing backslash */
+            size_t dl=strlen(outdir_override);
+            if(dl>0 && outdir_override[dl-1]!='\\' && outdir_override[dl-1]!='/')
+                strcat(outdir_override,"\\");
+        }
         else if(strcmp(argv[i],"linrad"    )==0) out_fmt=FMT_LINRAD;
         else if(strcmp(argv[i],"wavviewdx" )==0) out_fmt=FMT_WAVVIEWDX;
         else if(strcmp(argv[i],"sdruno"    )==0) out_fmt=FMT_SDRUNO;
@@ -1775,11 +1855,16 @@ static int sdr_process_args(int argc, char *argv[])
     proc_log("Format      : %s\n",fmt_names[rec.fmt]);
     proc_log("Tuner       : %s\n",rec.tuner==TUNER_DUAL?"Dual (IA,QA,IB,QB)":"Single (I,Q)");
     proc_log("Sample rate : %d Hz\n",rec.sample_rate);
+    proc_log("Bits/sample : %d\n", rec.bits_per_sample>0 ? rec.bits_per_sample : 16);
     proc_log("Centre freq : %d Hz = %.3f kHz\n",rec.centre_freq_hz,rec.centre_freq_hz/1000.0);
     proc_log("Start time  : %04d-%02d-%02d %02d:%02d:%02d UTC\n",
            rec.year,rec.month,rec.day,rec.hour,rec.minute,rec.second);
 
-    uint64_t total_frames_in_file = rec.data_bytes / ((uint64_t)rec.num_channels*2);
+    int bytes_per_samp = (rec.bits_per_sample > 0) ? (rec.bits_per_sample/8) : 2;
+    uint64_t total_frames_in_file = rec.data_bytes / ((uint64_t)rec.num_channels*(uint64_t)bytes_per_samp);
+    proc_log("Data bytes  : %llu  bps=%d  ch=%d  -> %llu frames\n",
+             (unsigned long long)rec.data_bytes, bytes_per_samp,
+             rec.num_channels, (unsigned long long)total_frames_in_file);
     uint64_t total_secs=total_frames_in_file/(uint64_t)rec.sample_rate;
     proc_log("Duration    : %llu s\n",(unsigned long long)total_secs);
     proc_log("Output mode : %s -> %s\n",
@@ -1936,7 +2021,10 @@ static int sdr_process_args(int argc, char *argv[])
             break;
         default: outbase[0]='\0'; break;
     }
-    snprintf(outpath,sizeof(outpath),"%s%s",outdir,outbase);
+    if(outdir_override[0])
+        snprintf(outpath,sizeof(outpath),"%s%s",outdir_override,outbase);
+    else
+        snprintf(outpath,sizeof(outpath),"%s%s",outdir,outbase);
 
     /* Prevent input overwrite.
      * If the computed output name matches the input, append _cvt before
@@ -1990,8 +2078,8 @@ static int sdr_process_args(int argc, char *argv[])
     MultiByteToWideChar(CP_UTF8,0,inpath,-1,sr.paths[0],MAX_PATH);
     sr.count=1; sr.in_ch=rec.num_channels; sr.sample_rate=rec.sample_rate;
     sr.data_offset=rec.data_offset; sr.cur=0; sr.fp=NULL;
+    sr.bytes_per_samp = (rec.bits_per_sample>0) ? (rec.bits_per_sample/8) : 2;
     /* Add sequence files from global g_seq_paths (set by GUI) */
-    proc_log("g_seq_count = %d\n", g_seq_count);
     for(int si=0;si<g_seq_count && sr.count<SEQ_MAX;si++){
         wcsncpy(sr.paths[sr.count],g_seq_paths[si],MAX_PATH-1);
         proc_log("Adding seq: '%ls'\n", sr.paths[sr.count]);
@@ -2009,7 +2097,7 @@ static int sdr_process_args(int argc, char *argv[])
             _fseeki64(sf,0,SEEK_END);
             int64_t fsz=_ftelli64(sf); fclose(sf);
             int64_t db=fsz-rec.data_offset;
-            if(db>0) file_frames[si]=(uint64_t)db/((uint64_t)rec.num_channels*2);
+            if(db>0) file_frames[si]=(uint64_t)db/((uint64_t)rec.num_channels*(uint64_t)bytes_per_samp);
         } else {
             proc_log("Seq file %d : _wfopen failed errno=%d path='%ls'\n",si,errno,sr.paths[si]);
         }
@@ -2023,10 +2111,6 @@ static int sdr_process_args(int argc, char *argv[])
         uint64_t avail = seq_total_frames - start_frame;
         if(avail > in_frames) in_frames = avail;
     }
-    proc_log("Seq total   : %llu frames, start_frame=%llu, in_frames=%llu\n",
-             (unsigned long long)seq_total_frames,
-             (unsigned long long)start_frame,
-             (unsigned long long)in_frames);
 
     /* ── Seek to trim start within sequence ── */
 
@@ -2043,29 +2127,41 @@ static int sdr_process_args(int argc, char *argv[])
     /* ── Write output header ── */
     int64_t ds64_pos=-1, data_sz32_pos=-1;
     int use_rf64=0;
-    uint64_t out_data_bytes=out_frames*(uint64_t)out_ch*2;
-
-    /* Determine resampling need early — required by size check below */
+    /* Determine resampling need — Jaguar always outputs at 1,600,000 Hz except
+     * when converting to/from Perseus at 2,000,000 Hz (no resampling needed).
+     * Perseus outputs at its native recorded rate (no rate conversion). */
     int need_resamp = 0;
     int resamp_target = fs_out;
     if(!do_ddc){
-        if(out_fmt==FMT_JAGUAR && rec.sample_rate!=1600000){
+        if(out_fmt==FMT_JAGUAR && rec.sample_rate!=1600000
+           && !(rec.sample_rate==2000000 && rec.fmt==FMT_PERSEUS)){
+            /* Jaguar target rate is 1,600,000 Hz unless this is a 2MHz Perseus→Jaguar */
             need_resamp=1; resamp_target=1600000;
-        } else if(out_fmt==FMT_PERSEUS && rec.sample_rate!=1999000){
-            need_resamp=1; resamp_target=1999000;
         }
+        /* Perseus: no rate conversion — always write at the input sample rate */
     }
+
+    /* Determine output bits per sample — needs need_resamp/resamp_target to be set first */
+    int out_bps = 16;
+    if(out_fmt==FMT_PERSEUS){
+        uint32_t out_sr = need_resamp ? (uint32_t)resamp_target : (uint32_t)fs_out;
+        out_bps = (out_sr < 2000000) ? 24 : 16;
+        if(out_bps_override==16 || out_bps_override==24)
+            out_bps = out_bps_override;
+        proc_log("Output bits  : %d-bit%s\n", out_bps,
+                 out_bps_override ? " (user override)" : " (auto)");
+    }
+
+    uint64_t out_data_bytes=out_frames*(uint64_t)out_ch*(uint64_t)(out_bps/8);
 
     /* Perseus/Jaguar: check output won't exceed 4GB (no RF64 support) */
     if(out_fmt==FMT_PERSEUS||out_fmt==FMT_JAGUAR){
-        uint64_t target_sr = (out_fmt==FMT_JAGUAR)?1600000:1999000;
-        if(need_resamp) target_sr=resamp_target;
+        uint64_t target_sr = need_resamp ? (uint64_t)resamp_target : (uint64_t)rec.sample_rate;
         uint64_t max_data = 0xFFFFFFFFULL - 86;
-        uint64_t expected_bytes = out_frames*(uint64_t)out_ch*2;
-        /* Adjust for resampling ratio */
+        uint64_t expected_bytes = out_frames*(uint64_t)out_ch*(uint64_t)(out_bps/8);
         if(need_resamp)
             expected_bytes=(uint64_t)((double)out_frames*(double)resamp_target
-                            /rec.sample_rate*(uint64_t)out_ch*2);
+                            /rec.sample_rate*(uint64_t)out_ch*(uint64_t)(out_bps/8));
         if(expected_bytes > max_data){
             proc_log("Error: %s output would exceed 4 GB (%.1f GB).\n"
                      "  Maximum duration at this sample rate: %.0f seconds.\n"
@@ -2077,21 +2173,17 @@ static int sdr_process_args(int argc, char *argv[])
         }
     }
 
-    /* Perseus<->Jaguar cross-conversion is blocked: SDR Console hardcodes
-     * different sample rates for each (Jaguar=2MHz, Perseus=1.999MHz) making
-     * frequency-accurate conversion mathematically impossible. */
+    /* Perseus<->Jaguar cross-conversion: only allowed at 2,000,000 Hz (both 16-bit).
+     * At other rates the sample rates differ and conversion is not meaningful. */
     if(!do_ddc &&
        ((rec.fmt==FMT_PERSEUS && out_fmt==FMT_JAGUAR) ||
         (rec.fmt==FMT_JAGUAR  && out_fmt==FMT_PERSEUS))){
-        proc_log("Error: Perseus<->Jaguar conversion is not supported.\n"
-                 "  SDR Console hardcodes different sample rates for each format,\n"
-                 "  making frequency-accurate conversion impossible.\n"
-                 "  Convert to linrad, wavviewdx, sdruno or sdrconnect instead.\n");
-        seq_close(&sr); if(fout) fclose(fout); free(fir_h); return 1;
+        if(rec.sample_rate != 2000000){
+            proc_log("Error: Perseus<->Jaguar conversion only supported at 2,000,000 Hz.\n"
+                     "  Both formats record at 2 MHz and 16-bit at that rate.\n");
+            seq_close(&sr); if(fout) fclose(fout); free(fir_h); return 1;
+        }
     }
-
-    /* Resampling: currently no cross-format resampling needed beyond the
-     * blocked Perseus<->Jaguar case. Future HDSDR support will use this. */
 
     /* Warn if SDR Connect output would require RF64 */
     if(out_fmt==FMT_SDRCONNECT){
@@ -2132,17 +2224,15 @@ static int sdr_process_args(int argc, char *argv[])
         case FMT_SDRCONNECT:
         case FMT_PERSEUS:
         case FMT_JAGUAR: {
-            /* Write the rate the playback software expects:
-             * Jaguar without DDC: hardcode 1,600,000 Hz (Jaguar software expects this)
-             * Jaguar with DDC: write actual decimated rate (Jaguar reads fmt chunk)
-             * Perseus: always reads fmt chunk so write actual rate */
+            /* hdr_sr: for DDC write the decimated rate; for passthrough write the input rate;
+             * for resampled Jaguar output write the resampled rate. */
             uint32_t hdr_sr = need_resamp ? (uint32_t)resamp_target : (uint32_t)fs_out;
-            if(out_fmt==FMT_JAGUAR && !do_ddc) hdr_sr = 1600000;
+            if(out_fmt==FMT_JAGUAR && !do_ddc && !need_resamp) hdr_sr = 1600000;
             data_sz32_pos=write_wav_header(fout,out_fmt,out_data_bytes,
-                hdr_sr,(uint16_t)out_ch,(int32_t)ddc_cf_hz,
+                hdr_sr,(uint16_t)out_ch,(uint16_t)out_bps,(int32_t)ddc_cf_hz,
                 out_year,out_month,out_day,trim_sh,trim_sm,trim_ss,
                 end_yy,end_mm2,end_dd,end_hh2,end_mi2,end_ss2,
-                outpath,&rec.rcvr,&use_rf64,&ds64_pos);
+                outpath,&use_rf64,&ds64_pos);
             break; }
         default: break;
     }
@@ -2167,14 +2257,14 @@ static int sdr_process_args(int argc, char *argv[])
 
     int rc;
     if(do_ddc){
-        rc=copy_ddc(&sr,fout,warmup_frames,in_frames,rec.num_channels,out_ch,
+        rc=copy_ddc(&sr,fout,warmup_frames,in_frames,rec.num_channels,out_ch,out_bps,
                     fir_h,n_taps,ddc_D,delta_phi,ochan,label);
     } else if(need_resamp){
-        rc=copy_resample(&sr,fout,in_frames,rec.num_channels,out_ch,
+        rc=copy_resample(&sr,fout,in_frames,rec.num_channels,out_ch,out_bps,
                          rec.sample_rate,resamp_target,ochan,label);
         fs_out=resamp_target;
     } else {
-        rc=copy_passthrough(&sr,fout,in_frames,rec.num_channels,out_ch,
+        rc=copy_passthrough(&sr,fout,in_frames,rec.num_channels,out_ch,out_bps,
                             src_idx,label);
     }
     if(rc<0) goto write_error;
@@ -2182,7 +2272,7 @@ static int sdr_process_args(int argc, char *argv[])
     /* ── Finalise WAV headers ── */
     if(out_fmt==FMT_SDRUNO||out_fmt==FMT_SDRCONNECT||
        out_fmt==FMT_PERSEUS||out_fmt==FMT_JAGUAR){
-        finalise_wav(fout,use_rf64,ds64_pos,data_sz32_pos,out_ch);
+        finalise_wav(fout,use_rf64,ds64_pos,data_sz32_pos,out_ch,out_bps);
     }
 
     seq_close(&sr); fclose(fout); free(fir_h);
@@ -2247,8 +2337,12 @@ typedef struct {
 /* ------------------------------------------------------------------ */
 static HWND      g_hwnd;
 static int       g_sample_rate = 0;  /* sample rate of currently loaded file */
+static int       g_fi_fmt      = -1; /* format of currently loaded file */
+static wchar_t   g_out_folder[MAX_PATH] = {0}; /* custom output folder, or empty for same as input */
 static wchar_t   g_rec_info[128] = {0};  /* recording start/end info string */
-static wchar_t   g_sr_info[32]  = {0};  /* sample rate info string */
+static int       g_dur_secs    = 0;   /* total recording duration in seconds */
+static BOOL      g_outfile_warn = FALSE; /* TRUE when output label shows 4GB warning */
+static wchar_t   g_sr_info[64]  = {0};  /* sample rate info string */
 
 static HINSTANCE g_hinst;
 static BOOL      g_running    = FALSE;
@@ -2293,6 +2387,8 @@ static int ini_ri(const wchar_t *sec,const wchar_t *key,int def)
 /* ------------------------------------------------------------------ */
 static void update_channel_controls(void);  /* forward declaration */
 static void update_format_controls(void);    /* forward declaration */
+static int  populate_bw_dropdown(HWND hwnd, int fs_in, int out_fmt);  /* forward declaration */
+static BOOL sample_rate_decimates_cleanly(int fs_in);     /* forward declaration */
 static void update_run_batch_button(void);   /* forward declaration */
 
 static void save_settings(void)
@@ -2313,6 +2409,7 @@ static void save_settings(void)
         IsDlgButtonChecked(g_hwnd,ID_FMT_JAGUAR)?6:0);
     ini_wi(L"S",L"DDC", IsDlgButtonChecked(g_hwnd,ID_DDC_CHECK)?1:0);
     GetWindowTextW(GetDlgItem(g_hwnd,ID_DDC_CENTRE),b,16); ini_ws(L"S",L"DDCcf",b);
+    ini_ws(L"S",L"OutFolder",g_out_folder);
     { HWND hcb=GetDlgItem(g_hwnd,ID_DDC_BW);
       int sel=(int)SendMessageW(hcb,CB_GETCURSEL,0,0);
       wchar_t bwlbl[32]={0};
@@ -2342,6 +2439,7 @@ static void restore_settings(void)
     EnableWindow(GetDlgItem(g_hwnd,ID_DDC_CENTRE),ddc);
     EnableWindow(GetDlgItem(g_hwnd,ID_DDC_BW),    ddc);
     ini_rs(L"S",L"DDCcf",L"",b,16); SetWindowTextW(GetDlgItem(g_hwnd,ID_DDC_CENTRE),b);
+    ini_rs(L"S",L"OutFolder",L"",g_out_folder,MAX_PATH);
     /* DDCbw is restored by populate_bw_dropdown when file is loaded */
     update_format_controls();
 }
@@ -2367,6 +2465,7 @@ typedef struct {
     int  fmt;
     int  dual;
     int  sample_rate;
+    int  bits_per_sample;
     int  centre_hz;
     int  year,mon,day,hour,min,sec;
     int  utc_digit;
@@ -2396,6 +2495,7 @@ static BOOL probe_file(const wchar_t *path,FileInfo *fi)
         double pc; memcpy(&pc,&u64,8); fi->centre_hz=(int)(pc*1e6+0.5);
         fi->dual=(rd32(hdr+32)==4)?1:0;
         fi->sample_rate=(int)rd32(hdr+36);
+        fi->bits_per_sample=16;
         u64=0; for(int i=0;i<8;i++) u64|=(uint64_t)hdr[4+i]<<(i*8);
         /* Linrad timestamp: new files store seconds-of-day, old files stored Unix epoch.
          * Distinguish by value: seconds-of-day is always < 86400. */
@@ -2456,11 +2556,15 @@ static BOOL probe_file(const wchar_t *path,FileInfo *fi)
                 continue;
             }
             if(memcmp(id,"fmt ",4)==0){
-                /* PCM fmt: channels at +2, sample_rate at +4 (all relative to chunk data start) */
+                /* PCM fmt: channels at +2, sample_rate at +4, bits at +14 (all relative to chunk data start) */
                 if(pos+8+10<=(uint32_t)got){
                     fi->sample_rate=(int)rd32(hdr+pos+12);  /* pos+8+4 */
                     uint16_t nch=rd16(hdr+pos+10);           /* pos+8+2 */
                     fi->dual=(nch==4)?1:0;
+                    if(pos+8+16<=(uint32_t)got)
+                        fi->bits_per_sample=(int)rd16(hdr+pos+22); /* pos+8+14 */
+                    else
+                        fi->bits_per_sample=16;
                 }
                 have_fmt=1;
                 pos+=8+csz; if(csz&1)pos++;
@@ -2553,7 +2657,7 @@ static BOOL probe_file(const wchar_t *path,FileInfo *fi)
         wchar_t *dot=wcsrchr(stem,L'.'); if(dot)*dot=L'\0';
         wchar_t *pat=wcsstr(stem,L"iq_pcm16_ch");
         if(pat){
-            fi->fmt=1; int ch=0; swscanf(pat+11,L"%d",&ch); fi->dual=(ch==2)?1:0;
+            fi->fmt=1; fi->bits_per_sample=16; int ch=0; swscanf(pat+11,L"%d",&ch); fi->dual=(ch==2)?1:0;
             wchar_t *cf=wcsstr(pat,L"_cf"); if(cf) swscanf(cf+3,L"%d",&fi->centre_hz);
             wchar_t *sr=wcsstr(pat,L"_sr"); if(sr) swscanf(sr+3,L"%d",&fi->sample_rate);
             wchar_t *dt=wcsstr(pat,L"_dt");
@@ -2585,20 +2689,19 @@ static BOOL predict_outfile(const wchar_t *inpath,wchar_t *outfile,int n)
         wchar_t buf[16]; GetWindowTextW(GetDlgItem(g_hwnd,ID_DDC_CENTRE),buf,16);
         int ddc_cf=_wtoi(buf); if(ddc_cf>0) cf=ddc_cf*1000;
     }
-    int sy=fi.year,smo=fi.mon,sd=fi.day,sh=fi.hour,smi=fi.min;
+    int sy=fi.year,smo=fi.mon,sd=fi.day,sh=fi.hour,smi=fi.min,ss=fi.sec;
     if(IsDlgButtonChecked(g_hwnd,ID_MODE_TRIM)){
-        wchar_t buf[8]; int hh=0,mm=0;
+        wchar_t buf[8]; int hh=0,mm=0,hh_s=0;
         GetWindowTextW(GetDlgItem(g_hwnd,ID_START_EDIT),buf,8);
-        int hh_s=0;
         if(wcslen(buf)==6) swscanf(buf,L"%2d%2d%2d",&hh,&mm,&hh_s);
-        else if(wcslen(buf)==4) swscanf(buf,L"%2d%2d",&hh,&mm); /* backwards compat */
+        else if(wcslen(buf)==4) swscanf(buf,L"%2d%2d",&hh,&mm);
         int64_t file_ep=utc_to_unix(fi.year,fi.mon,fi.day,fi.hour,fi.min,fi.sec);
         int64_t start_ep=utc_to_unix(fi.year,fi.mon,fi.day,hh,mm,hh_s);
         if(start_ep<file_ep){
             int64_t next=start_ep+86400; int dummy_s;
             unix_to_utc(next,&sy,&smo,&sd,&sh,&smi,&dummy_s);
-            smi=mm; sh=hh;
-        } else { sy=fi.year; smo=fi.mon; sd=fi.day; sh=hh; smi=mm; }
+            smi=mm; sh=hh; ss=hh_s;
+        } else { sy=fi.year; smo=fi.mon; sd=fi.day; sh=hh; smi=mm; ss=hh_s; }
     }
     int sr=fi.sample_rate;
     if(IsDlgButtonChecked(g_hwnd,ID_DDC_CHECK)){
@@ -2613,21 +2716,31 @@ static BOOL predict_outfile(const wchar_t *inpath,wchar_t *outfile,int n)
 
     switch(out_fmt){
     case 0: _snwprintf(name,MAX_PATH,L"%04d%02d%02d_%02d%02d%02dZ_%dkHz.raw",
-                sy,smo,sd,sh,smi,0,cf/1000); break;
+                sy,smo,sd,sh,smi,ss,cf/1000); break;
     case 1: _snwprintf(name,MAX_PATH,L"iq_pcm16_ch%d_cf%d_sr%d_dt%04d%02d%02d-%02d%02d%02d.raw",
-                dual_out?2:1,cf,sr,sy,smo,sd,sh,smi,0); break;
+                dual_out?2:1,cf,sr,sy,smo,sd,sh,smi,ss); break;
     case 2: _snwprintf(name,MAX_PATH,L"SDRuno_%04d%02d%02d_%02d%02d%02dZ_%dkHz.wav",
-                sy,smo,sd,sh,smi,0,cf/1000); break;
+                sy,smo,sd,sh,smi,ss,cf/1000); break;
     case 3: _snwprintf(name,MAX_PATH,L"SDRconnect_IQ_%04d%02d%02d_%02d%02d%02d_%dHZ.wav",
-                sy,smo,sd,sh,smi,0,cf); break;
+                sy,smo,sd,sh,smi,ss,cf); break;
     case 4: _snwprintf(name,MAX_PATH,L"Perseus_%04d%02d%02d_%02d%02d%02dZ_%dkHz.wav",
-                sy,smo,sd,sh,smi,0,cf/1000); break;
+                sy,smo,sd,sh,smi,ss,cf/1000); break;
     case 5: _snwprintf(name,MAX_PATH,L"Jaguar_%04d%02d%02d_%02d%02d%02dZ_%dkHz.wav",
-                sy,smo,sd,sh,smi,0,cf/1000); break;
+                sy,smo,sd,sh,smi,ss,cf/1000); break;
     default: return FALSE;
     }
-    wchar_t dir[MAX_PATH]; wcsncpy(dir,inpath,MAX_PATH-1);
-    wchar_t *sl=wcsrchr(dir,L'\\'); if(sl){ sl[1]=L'\0'; } else { dir[0]=L'\0'; }
+    wchar_t dir[MAX_PATH];
+    if(g_out_folder[0]){
+        /* Use custom output folder */
+        wcsncpy(dir,g_out_folder,MAX_PATH-1); dir[MAX_PATH-1]=L'\0';
+        /* Ensure trailing backslash */
+        size_t dl=wcslen(dir);
+        if(dl>0 && dir[dl-1]!=L'\\') { dir[dl]=L'\\'; dir[dl+1]=L'\0'; }
+    } else {
+        /* Default: same folder as input */
+        wcsncpy(dir,inpath,MAX_PATH-1);
+        wchar_t *sl=wcsrchr(dir,L'\\'); if(sl){ sl[1]=L'\0'; } else { dir[0]=L'\0'; }
+    }
     _snwprintf(outfile,n,L"%s%s",dir,name);
     return TRUE;
 }
@@ -2687,6 +2800,20 @@ static BOOL build_cmdline(wchar_t *cmd,int n)
         }
         wchar_t d[64]; _snwprintf(d,64,L" --ddc %s %s",cf,bw);
         wcsncat(cmd,d,n-wcslen(cmd)-1);
+    }
+    /* Append --24bit flag for Perseus output if 24-bit is selected */
+    if(IsDlgButtonChecked(g_hwnd,ID_FMT_PERSEUS) &&
+       IsDlgButtonChecked(g_hwnd,ID_OUT_24BIT)){
+        wcsncat(cmd,L" --24bit",n-wcslen(cmd)-1);
+    } else if(IsDlgButtonChecked(g_hwnd,ID_FMT_PERSEUS) &&
+              IsDlgButtonChecked(g_hwnd,ID_OUT_16BIT)){
+        wcsncat(cmd,L" --16bit",n-wcslen(cmd)-1);
+    }
+    /* Append --outdir if a custom output folder is set */
+    if(g_out_folder[0]){
+        wcsncat(cmd,L" --outdir \"",n-wcslen(cmd)-1);
+        wcsncat(cmd,g_out_folder,n-wcslen(cmd)-1);
+        wcsncat(cmd,L"\"",n-wcslen(cmd)-1);
     }
     /* Append --seq paths for each sequence file */
     for(int si=0;si<g_seq_count;si++){
@@ -2754,15 +2881,17 @@ static void update_channel_controls(void)
     FileInfo fi; fi.dual=1; /* default: assume dual if unknown */
     if(input[0]) probe_file(input,&fi);
     g_sample_rate = fi.sample_rate;
+    g_fi_fmt      = fi.fmt;
 
     /* Build recording time info string */
     if(input[0] && fi.fmt >= 0 && fi.sample_rate > 0){
         struct _stat64 st; int dur_sec=0;
         if(_wstat64(input,&st)==0 && st.st_size > 0){
             int ch = fi.dual ? 4 : 2;
+            int bps = (fi.bits_per_sample > 0) ? (fi.bits_per_sample/8) : 2;
             int64_t data_bytes = st.st_size - (fi.fmt<=1 ? 41 : 200);
             if(data_bytes > 0)
-                dur_sec = (int)(data_bytes / ((int64_t)fi.sample_rate * ch * 2));
+                dur_sec = (int)(data_bytes / ((int64_t)fi.sample_rate * ch * bps));
         }
         /* Add durations of any sequence files */
         for(int si=0; si<g_seq_count; si++){
@@ -2780,14 +2909,17 @@ static void update_channel_controls(void)
             fi.hour,fi.min,fi.sec,
             (end_sod/3600)%24,(end_sod%3600)/60,end_sod%60,
             dur_sec/3600,(dur_sec%3600)/60);
+        g_dur_secs = dur_sec;
     } else {
         wcscpy(g_rec_info,L"Recording:  (no file loaded)");
+        g_dur_secs = 0;
     }
         SetWindowTextW(GetDlgItem(g_hwnd,ID_REC_INFO),g_rec_info);
 
     /* Sample rate display */
     if(input[0] && fi.sample_rate > 0){
-        _snwprintf(g_sr_info,32,L"Sample rate: %d sps",fi.sample_rate);
+        int bps_disp = fi.bits_per_sample > 0 ? fi.bits_per_sample : 16;
+        _snwprintf(g_sr_info,64,L"Sample rate: %d sps  %d-bit",fi.sample_rate,bps_disp);
     } else {
         g_sr_info[0]=L'\0';
     }
@@ -2815,6 +2947,33 @@ static void update_run_batch_button(void)
 
 
 
+/* Show/hide the bit-depth radio buttons (only visible for Perseus output).
+ * set_default=TRUE resets to the natural bit depth for the rate. */
+static void update_24bit_control(int out_sample_rate, int in_bps, BOOL perseus_out, BOOL set_default)
+{
+
+    /* 2,000,000 Hz and 1,999,000 Hz Perseus output must be 16-bit — force it
+     * and hide the choice since there is no valid alternative. */
+    BOOL force16 = (out_sample_rate == 2000000 || out_sample_rate == 1999000);
+    BOOL show_choice = perseus_out && !force16;
+
+    ShowWindow(GetDlgItem(g_hwnd, ID_BIT_LABEL), show_choice ? SW_SHOW : SW_HIDE);
+    ShowWindow(GetDlgItem(g_hwnd, ID_OUT_16BIT), show_choice ? SW_SHOW : SW_HIDE);
+    ShowWindow(GetDlgItem(g_hwnd, ID_OUT_24BIT), show_choice ? SW_SHOW : SW_HIDE);
+
+    if(!perseus_out || force16){
+        CheckRadioButton(g_hwnd, ID_OUT_16BIT, ID_OUT_24BIT, ID_OUT_16BIT);
+        return;
+    }
+    if(set_default){
+        /* Default to match the input bit depth — 24-bit if input is 24-bit,
+         * 16-bit otherwise (e.g. converting from Linrad/SDRuno). */
+        BOOL def24 = (in_bps == 24);
+        CheckRadioButton(g_hwnd, ID_OUT_16BIT, ID_OUT_24BIT,
+                         def24 ? ID_OUT_24BIT : ID_OUT_16BIT);
+    }
+}
+
 static void update_format_controls(void)
 {
     /* Grey out format buttons that would produce a same-format no-op.
@@ -2838,65 +2997,135 @@ static void update_format_controls(void)
     probe_file(input,&fi);
     if(fi.fmt<0) return;
 
-    /* Grey out formats whose hardcoded playback rate doesn't match input.
-     * SDRuno and SDR Connect hardcode 2,000,000 Hz regardless of fmt chunk.
-     * Jaguar hardcodes 1,600,000 Hz. Perseus and Linrad/WavViewDX read fmt chunk. */
-    if(fi.sample_rate > 0 && fi.sample_rate != 2000000){
-        /* Input not at 2MHz — SDRuno and SDR Connect will play at wrong speed/frequency */
-        if(IsDlgButtonChecked(g_hwnd,ID_FMT_SDRUNO)||
-           IsDlgButtonChecked(g_hwnd,ID_FMT_SDRCONNECT))
-            CheckRadioButton(g_hwnd,ID_FMT_SAME,ID_FMT_JAGUAR,ID_FMT_SAME);
-        EnableWindow(GetDlgItem(g_hwnd,ID_FMT_SDRUNO),     FALSE);
-        EnableWindow(GetDlgItem(g_hwnd,ID_FMT_SDRCONNECT), FALSE);
-    }
-    if(fi.sample_rate > 0 && fi.sample_rate != 1999000){
-        /* Input not at 1.999MHz — Perseus format requires exactly this rate */
-        if(IsDlgButtonChecked(g_hwnd,ID_FMT_PERSEUS))
-            CheckRadioButton(g_hwnd,ID_FMT_SAME,ID_FMT_JAGUAR,ID_FMT_SAME);
-        EnableWindow(GetDlgItem(g_hwnd,ID_FMT_PERSEUS), FALSE);
-    }
-    if(fi.sample_rate > 0 && fi.sample_rate != 1600000){
-        /* Input not at 1.6MHz — Jaguar will play at wrong speed/frequency */
-        if(IsDlgButtonChecked(g_hwnd,ID_FMT_JAGUAR))
-            CheckRadioButton(g_hwnd,ID_FMT_SAME,ID_FMT_JAGUAR,ID_FMT_SAME);
-        EnableWindow(GetDlgItem(g_hwnd,ID_FMT_JAGUAR), FALSE);
+
+    if(fi.fmt!=4 && fi.fmt!=5){
+        /* Non-Perseus/Jaguar input: Perseus output requires resampling to a
+         * Perseus-native rate — only allow if input rate matches a Perseus rate */
+        static const int perseus_rates[]={125000,250000,500000,1000000,2000000,1999000,0};
+        BOOL ok_per=FALSE;
+        for(int i=0;perseus_rates[i];i++) if(fi.sample_rate==perseus_rates[i]){ok_per=TRUE;break;}
+        if(!ok_per){
+            if(IsDlgButtonChecked(g_hwnd,ID_FMT_PERSEUS))
+                CheckRadioButton(g_hwnd,ID_FMT_SAME,ID_FMT_JAGUAR,ID_FMT_SAME);
+            EnableWindow(GetDlgItem(g_hwnd,ID_FMT_PERSEUS), FALSE);
+        }
+        /* Jaguar output: only allow at Jaguar-native rates */
+        BOOL ok_jag=(fi.sample_rate==1600000||fi.sample_rate==2000000);
+        if(!ok_jag){
+            if(IsDlgButtonChecked(g_hwnd,ID_FMT_JAGUAR))
+                CheckRadioButton(g_hwnd,ID_FMT_SAME,ID_FMT_JAGUAR,ID_FMT_SAME);
+            EnableWindow(GetDlgItem(g_hwnd,ID_FMT_JAGUAR), FALSE);
+        }
     }
 
     BOOL trimming   = IsDlgButtonChecked(g_hwnd,ID_MODE_TRIM);
     BOOL ddc        = IsDlgButtonChecked(g_hwnd,ID_DDC_CHECK);
+
+    /* Grey out SDRuno/SDRConnect if effective output rate != 2MHz.
+     * When DDC active use the decimated rate, not the input rate. */
+    int eff_out_rate = fi.sample_rate;
+    if(ddc && fi.sample_rate > 0){
+        HWND hcb_sr = GetDlgItem(g_hwnd, ID_DDC_BW);
+        int sel_sr = (int)SendMessageW(hcb_sr, CB_GETCURSEL, 0, 0);
+        if(sel_sr >= 0){
+            int D_sr = (int)SendMessageW(hcb_sr, CB_GETITEMDATA, (WPARAM)sel_sr, 0);
+            if(D_sr > 0) eff_out_rate = fi.sample_rate / D_sr;
+        }
+    }
+    if(eff_out_rate > 0 && eff_out_rate != 2000000){
+        /* SDRuno hardcodes 2MHz — grey it out for non-2MHz output.
+         * SDR Connect reads the fmt chunk so it handles variable rates. */
+        if(IsDlgButtonChecked(g_hwnd,ID_FMT_SDRUNO))
+            CheckRadioButton(g_hwnd,ID_FMT_SAME,ID_FMT_JAGUAR,ID_FMT_SAME);
+        EnableWindow(GetDlgItem(g_hwnd,ID_FMT_SDRUNO), FALSE);
+    }
     /* ch1/ch2 only counts as extraction when input is dual-channel */
     BOOL ch_extract = fi.dual &&
                       (IsDlgButtonChecked(g_hwnd,ID_CHAN_CH1) ||
                        IsDlgButtonChecked(g_hwnd,ID_CHAN_CH2));
     BOOL dual_out   = fi.dual && !ch_extract;
 
-    /* Perseus<->Jaguar cross-conversion is not supported (SDR Console hardcodes
-     * different sample rates per format making frequency-accurate conversion impossible).
-     * Gray out the cross-format option. */
-    if(fi.fmt==4){  /* Perseus input: disable Jaguar output */
-        if(IsDlgButtonChecked(g_hwnd,ID_FMT_JAGUAR))
-            CheckRadioButton(g_hwnd,ID_FMT_SAME,ID_FMT_JAGUAR,ID_FMT_PERSEUS);
-        EnableWindow(GetDlgItem(g_hwnd,ID_FMT_JAGUAR), FALSE);
-    } else if(fi.fmt==5){  /* Jaguar input: disable Perseus output */
-        if(IsDlgButtonChecked(g_hwnd,ID_FMT_PERSEUS))
-            CheckRadioButton(g_hwnd,ID_FMT_SAME,ID_FMT_JAGUAR,ID_FMT_JAGUAR);
-        EnableWindow(GetDlgItem(g_hwnd,ID_FMT_PERSEUS), FALSE);
+    /* Perseus/Jaguar cross-format: only allow at 2,000,000 Hz (both 16-bit). */
+    if(fi.fmt==4){  /* Perseus input */
+        BOOL allow_jag = (fi.sample_rate == 2000000);
+        if(!allow_jag){
+            if(IsDlgButtonChecked(g_hwnd,ID_FMT_JAGUAR))
+                CheckRadioButton(g_hwnd,ID_FMT_SAME,ID_FMT_JAGUAR,ID_FMT_PERSEUS);
+        }
+        EnableWindow(GetDlgItem(g_hwnd,ID_FMT_JAGUAR), allow_jag);
+    } else if(fi.fmt==5){  /* Jaguar input */
+        BOOL allow_per = (fi.sample_rate == 2000000);
+        if(!allow_per){
+            if(IsDlgButtonChecked(g_hwnd,ID_FMT_PERSEUS))
+                CheckRadioButton(g_hwnd,ID_FMT_SAME,ID_FMT_JAGUAR,ID_FMT_JAGUAR);
+        }
+        EnableWindow(GetDlgItem(g_hwnd,ID_FMT_PERSEUS), allow_per);
     }
 
-    /* Perseus: DDC not supported. 1,999,000 Hz has 1999 as a prime factor,
-     * so every possible decimation produces a non-round output rate
-     * (e.g. 199,900 Hz). Testing shows this causes frequency/speed errors
-     * even in HDSDR (860.000 kHz measured as 860.430 kHz), not just SDR
-     * Console. Disabled until tested with other Perseus sample rates. */
-    if(fi.fmt==4){
+    /* Compute DDC output rate from selected BW dropdown */
+    int ddc_out_rate = 0;
+    if(ddc){
+        HWND hcb2 = GetDlgItem(g_hwnd, ID_DDC_BW);
+        int sel2 = (int)SendMessageW(hcb2, CB_GETCURSEL, 0, 0);
+        if(sel2 >= 0){
+            int D2 = (int)SendMessageW(hcb2, CB_GETITEMDATA, (WPARAM)sel2, 0);
+            if(D2 > 0) ddc_out_rate = fi.sample_rate / D2;
+        }
+    }
+    /* Disable Perseus/Jaguar output for non-native DDC output rates */
+    { static const int nat[]={125000,250000,500000,1000000,2000000,0};
+      BOOL native_ddc = !ddc;
+      for(int ni=0; nat[ni] && !native_ddc; ni++)
+          if(ddc_out_rate==nat[ni]) native_ddc=TRUE;
+      if(!native_ddc){
+          if(IsDlgButtonChecked(g_hwnd,ID_FMT_PERSEUS)||
+             IsDlgButtonChecked(g_hwnd,ID_FMT_JAGUAR))
+              CheckRadioButton(g_hwnd,ID_FMT_SAME,ID_FMT_JAGUAR,ID_FMT_SAME);
+          EnableWindow(GetDlgItem(g_hwnd,ID_FMT_PERSEUS), FALSE);
+          EnableWindow(GetDlgItem(g_hwnd,ID_FMT_JAGUAR),  FALSE);
+      }
+    }
+    /* DDC availability: rates with only 2/5 prime factors give clean output.
+     * 1,999,000 Hz has prime factor 1999 â allow DDC but warn of ~0.05% error. */
+    /* Resolve effective output format for BW filter */
+    int eff_fmt_bw = fi.fmt;  /* default: same as input */
+    if(IsDlgButtonChecked(g_hwnd,ID_FMT_PERSEUS))     eff_fmt_bw=4;
+    else if(IsDlgButtonChecked(g_hwnd,ID_FMT_JAGUAR))  eff_fmt_bw=5;
+    else if(IsDlgButtonChecked(g_hwnd,ID_FMT_LINRAD))  eff_fmt_bw=0;
+    else if(IsDlgButtonChecked(g_hwnd,ID_FMT_WAVVIEWDX)) eff_fmt_bw=1;
+    else if(IsDlgButtonChecked(g_hwnd,ID_FMT_SDRUNO))  eff_fmt_bw=2;
+    else if(IsDlgButtonChecked(g_hwnd,ID_FMT_SDRCONNECT)) eff_fmt_bw=3;
+    int n_ddc_opts = populate_bw_dropdown(g_hwnd, fi.sample_rate, eff_fmt_bw);
+    HWND hu = GetDlgItem(g_hwnd, ID_DDC_UNAVAIL);
+    if(n_ddc_opts == 0 && fi.sample_rate == 1999000){
+        EnableWindow(GetDlgItem(g_hwnd,ID_DDC_CHECK),TRUE);
+        HWND hcb=GetDlgItem(g_hwnd,ID_DDC_BW);
+        SendMessageW(hcb,CB_RESETCONTENT,0,0);
+        int sr=fi.sample_rate;
+        for(int D=2;D<=sr/50000;D++){
+            if(sr%D!=0) continue;
+            int fo=sr/D; if(fo<50000) break;
+            wchar_t lbl[32];
+            if(fo%1000==0) swprintf(lbl,32,L"%d kHz",fo/1000);
+            else swprintf(lbl,32,L"%.1f kHz",(double)fo/1000.0);
+            int idx=(int)SendMessageW(hcb,CB_ADDSTRING,0,(LPARAM)lbl);
+            SendMessageW(hcb,CB_SETITEMDATA,(WPARAM)idx,(LPARAM)D);
+        }
+        SendMessageW(hcb,CB_SETCURSEL,0,0);
+        SetWindowTextW(hu,L"⚠ Frequency accuracy ±0.05%");
+        ShowWindow(hu,SW_SHOW);
+    } else if(n_ddc_opts == 0){
         if(IsDlgButtonChecked(g_hwnd,ID_DDC_CHECK)){
             CheckDlgButton(g_hwnd,ID_DDC_CHECK,BST_UNCHECKED);
             EnableWindow(GetDlgItem(g_hwnd,ID_DDC_CENTRE),FALSE);
             EnableWindow(GetDlgItem(g_hwnd,ID_DDC_BW),    FALSE);
         }
         EnableWindow(GetDlgItem(g_hwnd,ID_DDC_CHECK),FALSE);
+        SetWindowTextW(hu,L"Not available at this sample rate");
+        ShowWindow(hu,SW_SHOW);
     } else {
         EnableWindow(GetDlgItem(g_hwnd,ID_DDC_CHECK),TRUE);
+        ShowWindow(hu,SW_HIDE);
     }
 
     /* For dual output, sdruno and sdrconnect are never valid (single-tuner only) */
@@ -2930,6 +3159,24 @@ static void update_format_controls(void)
         return;
     }
 
+    /* Update bit-depth radio visibility — only for Perseus output */
+    {
+        /* Effective output format — resolve "Same as input" */
+        BOOL per_out = IsDlgButtonChecked(g_hwnd,ID_FMT_PERSEUS) ||
+                       (IsDlgButtonChecked(g_hwnd,ID_FMT_SAME) && fi.fmt==4);
+        /* Effective output sample rate — use DDC rate if DDC active */
+        int bdc_out_sr = fi.sample_rate;
+        if(per_out && IsDlgButtonChecked(g_hwnd,ID_DDC_CHECK)){
+            HWND hcb_bd = GetDlgItem(g_hwnd, ID_DDC_BW);
+            int sel_bd = (int)SendMessageW(hcb_bd, CB_GETCURSEL, 0, 0);
+            if(sel_bd >= 0){
+                int D_bd = (int)SendMessageW(hcb_bd, CB_GETITEMDATA, (WPARAM)sel_bd, 0);
+                if(D_bd > 0) bdc_out_sr = fi.sample_rate / D_bd;
+            }
+        }
+        update_24bit_control(bdc_out_sr, fi.bits_per_sample, per_out, per_out);
+    }
+
     /* Single output: disable same-format if it would be a no-op */
     if(trimming || ddc) return;
 
@@ -2948,6 +3195,7 @@ static void update_format_controls(void)
         CheckRadioButton(g_hwnd,ID_FMT_SAME,ID_FMT_JAGUAR,ID_FMT_SAME);
 }
 
+
 static void update_prediction(void)
 {
     wchar_t input[MAX_PATH];
@@ -2956,12 +3204,50 @@ static void update_prediction(void)
         SetWindowTextW(GetDlgItem(g_hwnd,ID_OUTFILE_STATIC),L"Output: (select input file)");
         return;
     }
+    g_outfile_warn = FALSE;
     wchar_t outfile[MAX_PATH];
     if(predict_outfile(input,outfile,MAX_PATH)){
-        wchar_t label[MAX_PATH+16];
+        wchar_t label[MAX_PATH+64];
         wchar_t *fn=wcsrchr(outfile,L'\\');
-        _snwprintf(label,MAX_PATH+16,L"Output: %s",fn?fn+1:outfile);
+        _snwprintf(label,MAX_PATH+64,L"Output: %s",fn?fn+1:outfile);
+
+        /* Warn if Perseus or Jaguar output would exceed 4 GB */
+        BOOL per_jag = IsDlgButtonChecked(g_hwnd,ID_FMT_PERSEUS) ||
+                       IsDlgButtonChecked(g_hwnd,ID_FMT_JAGUAR)  ||
+                       (IsDlgButtonChecked(g_hwnd,ID_FMT_SAME) &&
+                        (g_fi_fmt==4||g_fi_fmt==5));
+        if(per_jag && g_sample_rate > 0 && g_dur_secs > 0){
+            /* Effective duration: trim mode narrows it */
+            int eff_secs = g_dur_secs;
+            if(IsDlgButtonChecked(g_hwnd,ID_MODE_TRIM)){
+                wchar_t ss[16],es[16];
+                GetWindowTextW(GetDlgItem(g_hwnd,ID_START_EDIT),ss,16);
+                GetWindowTextW(GetDlgItem(g_hwnd,ID_END_EDIT),es,16);
+                int sh=0,sm=0,ssc=0,eh=0,em=0,esc=0;
+                swscanf(ss,L"%2d%2d%2d",&sh,&sm,&ssc);
+                swscanf(es,L"%2d%2d%2d",&eh,&em,&esc);
+                int trim_secs=(eh*3600+em*60+esc)-(sh*3600+sm*60+ssc);
+                if(trim_secs>0 && trim_secs<eff_secs) eff_secs=trim_secs;
+            }
+            /* out_ch: DDC always produces single channel */
+            int out_ch = (!IsDlgButtonChecked(g_hwnd,ID_DDC_CHECK) &&
+                           IsDlgButtonChecked(g_hwnd,ID_CHAN_DUAL)) ? 4 : 2;
+            int out_bps = IsDlgButtonChecked(g_hwnd,ID_OUT_24BIT) ? 24 : 16;
+            uint64_t est_bytes = (uint64_t)eff_secs * (uint64_t)g_sample_rate
+                                 * (uint64_t)out_ch * (uint64_t)(out_bps/8);
+            uint64_t max_bytes = 0xFFFFFFFFULL - 128;
+            if(est_bytes > max_bytes){
+                double max_secs = (double)max_bytes /
+                                  ((double)g_sample_rate * out_ch * (out_bps/8));
+g_outfile_warn = TRUE;
+                wcscat(label, L"  ⚠ Exceeds 4 GB limit");
+                wchar_t warn[64];
+                _snwprintf(warn,64,L" — max %.0f s at this rate",max_secs);
+                wcscat(label, warn);
+            }
+        }
         SetWindowTextW(GetDlgItem(g_hwnd,ID_OUTFILE_STATIC),label);
+        InvalidateRect(GetDlgItem(g_hwnd,ID_OUTFILE_STATIC),NULL,TRUE);
     } else {
         SetWindowTextW(GetDlgItem(g_hwnd,ID_OUTFILE_STATIC),L"Output: (unable to predict)");
     }
@@ -3240,6 +3526,9 @@ static HWND mk_btn(HWND p,int id,const wchar_t *t,int x,int y,int w,int h,DWORD 
     x,y,w,h,p,(HMENU)(INT_PTR)id,g_hinst,NULL);
   SendMessageW(hw,WM_SETFONT,(WPARAM)g_font,FALSE); return hw; }
 
+
+
+
 static HWND mk_radio(HWND p,int id,const wchar_t *t,int x,int y,int w,int h,BOOL first)
 { DWORD s=WS_CHILD|WS_VISIBLE|WS_TABSTOP|BS_AUTORADIOBUTTON|(first?WS_GROUP:0);
   HWND hw=CreateWindowExW(0,L"BUTTON",t,s,x,y,w,h,p,(HMENU)(INT_PTR)id,g_hinst,NULL);
@@ -3261,11 +3550,31 @@ static HWND mk_group(HWND p,const wchar_t *t,int x,int y,int w,int h)
 /* Populate the DDC bandwidth combobox based on input file sample rate.
  * Shows only rates where fs_in % D == 0 AND fs_out >= 50000 AND fs_out % 100 == 0.
  * Stores D as item data so run_job can recover it without string parsing. */
-static void populate_bw_dropdown(HWND hwnd, int fs_in)
+/* True if fs_in's only prime factors are 2 and 5. Sample rates built purely
+ * from 2s and 5s decimate down to genuinely round output rates. A rate that
+ * carries any other prime factor (e.g. 1,999,000 = 2^3*5^3*1999) can never
+ * produce a truly clean decimated rate no matter what D is chosen, even if a
+ * given D happens to leave fs_out divisible by 100 — confirmed by testing:
+ * 1,999,000 Hz Perseus DDC'd output measured 0.05% off frequency in HDSDR. */
+static BOOL sample_rate_decimates_cleanly(int fs_in)
 {
+    if(fs_in <= 0) return FALSE;
+    while(fs_in % 2 == 0) fs_in /= 2;
+    while(fs_in % 5 == 0) fs_in /= 5;
+    return fs_in == 1;
+}
+
+static int populate_bw_dropdown(HWND hwnd, int fs_in, int out_fmt)
+{
+    /* out_fmt==4 (Perseus): only show rates native to Perseus hardware so
+     * WavViewDX can play the output correctly (125k/250k/500k/1000k). */
+    BOOL perseus_out = (out_fmt==4);
+    static const int perseus_native[]={125000,250000,500000,1000000,0};
+
     HWND hcb = GetDlgItem(hwnd, ID_DDC_BW);
     SendMessageW(hcb, CB_RESETCONTENT, 0, 0);
-    if(fs_in <= 0) return;
+    if(fs_in <= 0) return 0;
+    if(!sample_rate_decimates_cleanly(fs_in)) return 0;
 
     /* Try to restore previous selection */
     wchar_t prev[32]={0};
@@ -3277,6 +3586,14 @@ static void populate_bw_dropdown(HWND hwnd, int fs_in)
         int fs_out = fs_in / D;
         if(fs_out < 50000) break;
         if(fs_out % 100 != 0) continue;  /* skip non-round rates */
+
+        /* When Perseus output selected, skip non-native rates */
+        if(perseus_out){
+            BOOL native = FALSE;
+            for(int ni=0; perseus_native[ni]; ni++)
+                if(fs_out == perseus_native[ni]){ native=TRUE; break; }
+            if(!native) continue;
+        }
 
         wchar_t label[32];
         if(fs_out % 1000 == 0)
@@ -3291,6 +3608,7 @@ static void populate_bw_dropdown(HWND hwnd, int fs_in)
     }
     if(added > 0)
         SendMessageW(hcb, CB_SETCURSEL, (WPARAM)(prev_sel>=0 ? prev_sel : 0), 0);
+    return added;
 }
 
 static void create_controls(HWND hwnd)
@@ -3316,7 +3634,7 @@ static void create_controls(HWND hwnd)
       SendMessageW(hi,WM_SETFONT,(WPARAM)g_font,FALSE); }
     { HWND hs=CreateWindowExW(0,L"STATIC",L"",
         WS_CHILD|WS_VISIBLE|SS_RIGHT,
-        W-M-186,y+50,180,20,hwnd,(HMENU)(UINT_PTR)ID_SR_INFO,g_hinst,NULL);
+        W-M-246,y+50,240,20,hwnd,(HMENU)(UINT_PTR)ID_SR_INFO,g_hinst,NULL);
       SendMessageW(hs,WM_SETFONT,(WPARAM)g_font,FALSE); }
     /* Sequence listbox */
     { HWND hl=CreateWindowExW(WS_EX_CLIENTEDGE,L"LISTBOX",NULL,
@@ -3326,6 +3644,14 @@ static void create_controls(HWND hwnd)
     mk_btn(hwnd,ID_SEQ_REMOVE,L"Remove",W-M-60,y+74,58,24,BS_PUSHBUTTON);
     EnableWindow(GetDlgItem(hwnd,ID_SEQ_REMOVE),FALSE);
     y+=148;
+
+    /* ── Output Folder ── */
+    mk_group(hwnd,L"Output Folder",M,y,W-M*2,50);
+    { HWND he=mk_edit(hwnd,ID_OUTFOLDER_EDIT,M+10,y+18,W-M*2-196,22,FALSE,FALSE);
+      SetWindowTextW(he,g_out_folder); }
+    mk_btn(hwnd,ID_OUTFOLDER_BROWSE,L"Browse...",W-M-184,y+18,72,22,BS_PUSHBUTTON);
+    mk_btn(hwnd,ID_OUTFOLDER_CLEAR, L"Same as input",W-M-108,y+18,106,22,BS_PUSHBUTTON);
+    y+=58;
 
     /* ── Mode ── */
     mk_group(hwnd,L"Mode",M,y,W-M*2,54);
@@ -3347,6 +3673,9 @@ static void create_controls(HWND hwnd)
 
     /* ── DDC ── */
     mk_group(hwnd,L"DDC  (Digital Down-Conversion)",M,y,W-M*2,54);
+    { HWND hu=CreateWindowExW(0,L"STATIC",L"",WS_CHILD|SS_LEFT,
+        M+230,y,260,20,hwnd,(HMENU)(UINT_PTR)ID_DDC_UNAVAIL,g_hinst,NULL);
+      SendMessageW(hu,WM_SETFONT,(WPARAM)g_font,FALSE); }
     mk_check(hwnd,ID_DDC_CHECK,L"Enable",M+10,y+26,72,20);
     mk_static(hwnd,L"Centre:",M+92, y+28,52,16);
     mk_edit(hwnd,ID_DDC_CENTRE,M+146,y+24,68,24,FALSE,FALSE);
@@ -3358,15 +3687,24 @@ static void create_controls(HWND hwnd)
         (HINSTANCE)GetWindowLongPtrW(hwnd,GWLP_HINSTANCE),NULL);
       SetWindowPos(hbw,HWND_TOP,0,0,0,0,SWP_NOMOVE|SWP_NOSIZE); }
     y+=63;
-    mk_group(hwnd,L"Output Format",M,y,W-M*2,50);
-    mk_radio(hwnd,ID_FMT_SAME,      L"Same as input", M+8,  y+26,120,20,TRUE);
-    mk_radio(hwnd,ID_FMT_LINRAD,    L"Linrad",         M+138,y+26, 62,20,FALSE);
-    mk_radio(hwnd,ID_FMT_WAVVIEWDX, L"WavViewDX",      M+208,y+26, 96,20,FALSE);
-    mk_radio(hwnd,ID_FMT_SDRUNO,    L"SDRuno",         M+312,y+26, 70,20,FALSE);
-    mk_radio(hwnd,ID_FMT_SDRCONNECT,L"SDR Connect",    M+390,y+26,106,20,FALSE);
-    mk_radio(hwnd,ID_FMT_PERSEUS,   L"Perseus",        M+504,y+26, 74,20,FALSE);
-    mk_radio(hwnd,ID_FMT_JAGUAR,    L"Jaguar",         M+586,y+26, 68,20,FALSE);
-    y+=59;
+    mk_group(hwnd,L"Output Format",M,y,W-M*2,72);
+    mk_radio(hwnd,ID_FMT_SAME,      L"Same as input", M+8,  y+22,120,20,TRUE);
+    mk_radio(hwnd,ID_FMT_LINRAD,    L"Linrad",         M+136,y+22, 62,20,FALSE);
+    mk_radio(hwnd,ID_FMT_WAVVIEWDX, L"WavViewDX",      M+206,y+22, 96,20,FALSE);
+    mk_radio(hwnd,ID_FMT_SDRUNO,    L"SDRuno",         M+310,y+22, 70,20,FALSE);
+    mk_radio(hwnd,ID_FMT_SDRCONNECT,L"SDR Connect",    M+388,y+22,106,20,FALSE);
+    mk_radio(hwnd,ID_FMT_PERSEUS,   L"Perseus",        M+502,y+22, 74,20,FALSE);
+    mk_radio(hwnd,ID_FMT_JAGUAR,    L"Jaguar",         M+584,y+22, 68,20,FALSE);
+    /* Bit depth row — only visible for Perseus output */
+    { HWND hl=CreateWindowExW(0,L"STATIC",L"Bit depth:",WS_CHILD|SS_LEFT,
+        M+8,y+46,74,20,hwnd,(HMENU)(UINT_PTR)ID_BIT_LABEL,g_hinst,NULL);
+      SendMessageW(hl,WM_SETFONT,(WPARAM)g_font,FALSE); }
+    ShowWindow(GetDlgItem(hwnd,ID_BIT_LABEL),SW_HIDE);
+    mk_radio(hwnd,ID_OUT_16BIT,L"16-bit",M+84, y+46,60,20,TRUE);
+    mk_radio(hwnd,ID_OUT_24BIT,L"24-bit",M+150,y+46,60,20,FALSE);
+    ShowWindow(GetDlgItem(hwnd,ID_OUT_16BIT),SW_HIDE);
+    ShowWindow(GetDlgItem(hwnd,ID_OUT_24BIT),SW_HIDE);
+    y+=81;
 
     /* ── Predicted output label ── */
     HWND hpred=mk_static(hwnd,L"Output: (select input file)",M+2,y,W-M*2-4,18);
@@ -3456,6 +3794,24 @@ static void create_controls(HWND hwnd)
 /* ------------------------------------------------------------------ */
 /*  Browse for input file                                             */
 /* ------------------------------------------------------------------ */
+static void browse_folder(void)
+{
+    BROWSEINFOW bi; memset(&bi,0,sizeof(bi));
+    bi.hwndOwner = g_hwnd;
+    bi.lpszTitle = L"Select output folder";
+    bi.ulFlags   = BIF_RETURNONLYFSDIRS | BIF_NEWDIALOGSTYLE;
+    LPITEMIDLIST pidl = SHBrowseForFolderW(&bi);
+    if(pidl){
+        wchar_t path[MAX_PATH];
+        if(SHGetPathFromIDListW(pidl,path)){
+            wcsncpy(g_out_folder,path,MAX_PATH-1);
+            SetWindowTextW(GetDlgItem(g_hwnd,ID_OUTFOLDER_EDIT),g_out_folder);
+            update_prediction();
+        }
+        ILFree(pidl);
+    }
+}
+
 static void browse_file(void)
 {
     wchar_t buf[MAX_PATH]={0};
@@ -3480,6 +3836,9 @@ static void browse_file(void)
 /* ------------------------------------------------------------------ */
 /*  Window procedure                                                  */
 /* ------------------------------------------------------------------ */
+
+
+
 static LRESULT CALLBACK wnd_proc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp)
 {
     switch(msg){
@@ -3520,15 +3879,20 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp)
         MV(ID_BROWSE,     W-M-154,   g_header_h+14+22,  72,        24)
         MV(ID_SEQ_ADD,    W-M-74,    g_header_h+14+22,  62,        24)
         MV(ID_REC_INFO,   M+10,      g_header_h+14+50,  W-M*2-200, 20)
-        MV(ID_SR_INFO,    W-M-186,   g_header_h+14+50,  180,       20)
+        MV(ID_SR_INFO,    W-M-246,   g_header_h+14+50,  240,       20)
         MV(ID_SEQ_LIST,   M+10,      g_header_h+14+74,  W-M*2-72,  52)
         MV(ID_SEQ_REMOVE, W-M-60,    g_header_h+14+74,  58,        24)
 
+        /* Output folder */
+        MV(ID_OUTFOLDER_EDIT,    M+10,    g_header_h+14+170, W-M*2-196, 22)
+        MV(ID_OUTFOLDER_BROWSE,  W-M-184, g_header_h+14+170, 72,        22)
+        MV(ID_OUTFOLDER_CLEAR,   W-M-108, g_header_h+14+170, 106,       22)
+
         /* Prediction label stretches */
-        MV(ID_OUTFILE_STATIC, M+2,  458,  W-M*2-4, 18)
+        MV(ID_OUTFILE_STATIC, M+2,  538,  W-M*2-4, 18)
 
         /* Log group + edit stretch */
-        int log_top = 484;
+        int log_top = 564;
         int log_group_h = 120;
         MV(ID_LOG_EDIT,   M+8,      log_top+20, W-M*2-16, log_group_h)
         MV(ID_LOG_GROUP,  M,        log_top,    W-M*2,    log_group_h+22)
@@ -3579,6 +3943,16 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp)
             SetBkColor((HDC)wp,RGB(240,240,240));
             return (LRESULT)GetStockObject(LTGRAY_BRUSH);
         }
+        if((HWND)lp==GetDlgItem(hwnd,ID_DDC_UNAVAIL)){
+            SetTextColor((HDC)wp,RGB(196,43,43));
+            SetBkColor((HDC)wp,CLR_BG);
+            return (LRESULT)g_hbr_bg;
+        }
+        if((HWND)lp==GetDlgItem(hwnd,ID_OUTFILE_STATIC) && g_outfile_warn){
+            SetTextColor((HDC)wp,RGB(196,43,43));
+            SetBkColor((HDC)wp,CLR_BG);
+            return (LRESULT)g_hbr_bg;
+        }
         SetBkColor((HDC)wp,CLR_BG);
         return (LRESULT)g_hbr_bg;}
 
@@ -3593,6 +3967,7 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp)
         if(di->CtlID==ID_RUN)     { draw_run_button(di);   return TRUE; }
         if(di->CtlID==ID_CANCEL)  { draw_cancel_button(di);return TRUE; }
         if(di->CtlID==ID_PROGRESS){ draw_progress_bar(di); return TRUE; }
+
         if(di->CtlID==ID_HEADER_PANEL){
             FillRect(di->hDC,&di->rcItem,g_hbr_header);
             SetBkMode(di->hDC,TRANSPARENT);
@@ -3611,6 +3986,11 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp)
     case WM_COMMAND:
         switch(LOWORD(wp)){
         case ID_BROWSE: browse_file(); break;
+        case ID_OUTFOLDER_BROWSE: browse_folder(); break;
+        case ID_OUTFOLDER_CLEAR:
+            g_out_folder[0]=L'\0';
+            SetWindowTextW(GetDlgItem(hwnd,ID_OUTFOLDER_EDIT),L"");
+            update_prediction(); break;
 
         case ID_SEQ_ADD:{
             if(g_seq_count >= SEQ_MAX){
@@ -3687,16 +4067,37 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp)
                   SendDlgItemMessageW(hwnd,fmts[fi],BM_SETCHECK,
                       fmts[fi]==LOWORD(wp)?BST_CHECKED:BST_UNCHECKED,0);
             }
-            update_format_controls(); update_prediction(); break;
+            update_format_controls();
+            /* Set default bit depth AFTER update_format_controls so it isn't overridden */
+            if(LOWORD(wp)==ID_FMT_PERSEUS){
+                { FileInfo fi_bd; wchar_t inp_bd[MAX_PATH];
+                  GetWindowTextW(GetDlgItem(hwnd,ID_INPUT_EDIT),inp_bd,MAX_PATH);
+                  int in_bps_bd=16; int out_sr_bd=g_sample_rate;
+                  if(inp_bd[0] && probe_file(inp_bd,&fi_bd)) in_bps_bd=fi_bd.bits_per_sample;
+                  if(IsDlgButtonChecked(hwnd,ID_DDC_CHECK)){
+                      HWND hcb_c=GetDlgItem(hwnd,ID_DDC_BW);
+                      int sel_c=(int)SendMessageW(hcb_c,CB_GETCURSEL,0,0);
+                      if(sel_c>=0){ int D_c=(int)SendMessageW(hcb_c,CB_GETITEMDATA,(WPARAM)sel_c,0);
+                          if(D_c>0) out_sr_bd=g_sample_rate/D_c; }
+                  }
+                  update_24bit_control(out_sr_bd, in_bps_bd, TRUE, TRUE); }
+            }
+            update_prediction(); break;
         case ID_DDC_CHECK:{
             BOOL en=IsDlgButtonChecked(hwnd,ID_DDC_CHECK);
             EnableWindow(GetDlgItem(hwnd,ID_DDC_CENTRE),en);
             EnableWindow(GetDlgItem(hwnd,ID_DDC_BW),    en);
-        if(en) populate_bw_dropdown(hwnd, g_sample_rate);
+        if(en){
+            int efmt=g_fi_fmt; /* use last known input fmt */
+            if(IsDlgButtonChecked(hwnd,ID_FMT_PERSEUS)) efmt=4;
+            else if(IsDlgButtonChecked(hwnd,ID_FMT_JAGUAR)) efmt=5;
+            else if(!IsDlgButtonChecked(hwnd,ID_FMT_SAME)) efmt=-1;
+            populate_bw_dropdown(hwnd, g_sample_rate, efmt);
+        }
             update_format_controls(); update_prediction(); break;}
         case ID_DDC_CENTRE:
         case ID_START_EDIT: case ID_END_EDIT: case ID_INPUT_EDIT:
-            if(HIWORD(wp)==EN_CHANGE){ update_channel_controls(); update_format_controls(); populate_bw_dropdown(hwnd,g_sample_rate); update_prediction(); } break;
+            if(HIWORD(wp)==EN_CHANGE){ update_channel_controls(); update_format_controls(); update_prediction(); } break;
 
         case ID_RUN:
             if(g_running){
@@ -3707,18 +4108,6 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp)
                 break;
             }
             {
-                wchar_t input[MAX_PATH];
-                GetWindowTextW(GetDlgItem(hwnd,ID_INPUT_EDIT),input,MAX_PATH);
-                wchar_t outfile[MAX_PATH]={0};
-                if(predict_outfile(input,outfile,MAX_PATH)){
-                    if(GetFileAttributesW(outfile)!=INVALID_FILE_ATTRIBUTES){
-                        wchar_t msg[MAX_PATH+80];
-                        wchar_t *fn=wcsrchr(outfile,L'\\');
-                        _snwprintf(msg,MAX_PATH+80,L"Output file already exists:\n\n%s\n\nOverwrite?",fn?fn+1:outfile);
-                        if(MessageBoxW(hwnd,msg,L"SDR Trim - Overwrite?",
-                                MB_YESNO|MB_ICONWARNING|MB_DEFBUTTON2)!=IDYES) break;
-                    }
-                }
                 ThreadArgs *args=(ThreadArgs*)malloc(sizeof(ThreadArgs));
                 if(!args) break;
                 if(!build_cmdline(args->cmdline,4096)){ free(args); break; }
@@ -3975,7 +4364,7 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp)
         DragFinish((HDROP)wp);
         update_channel_controls();
         update_format_controls();
-        populate_bw_dropdown(hwnd, g_sample_rate);
+        populate_bw_dropdown(hwnd, g_sample_rate, g_fi_fmt);
         update_prediction();
         return 0;}
 
@@ -4033,7 +4422,7 @@ int WINAPI wWinMain(HINSTANCE hi,HINSTANCE hp,LPWSTR lp,int ns)
     wc.lpszClassName=L"SDRTrimGUI";
     RegisterClassExW(&wc);
 
-    int cw=780, ch=900;
+    int cw=820, ch=920;
     RECT rc={0,0,cw,ch};
     AdjustWindowRect(&rc,WS_OVERLAPPED|WS_CAPTION|WS_SYSMENU|WS_MINIMIZEBOX|WS_THICKFRAME,FALSE);
     int ww=rc.right-rc.left, wh=rc.bottom-rc.top;
