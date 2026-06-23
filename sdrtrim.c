@@ -1015,12 +1015,14 @@ static int64_t write_wav_header(FILE *fp,
     if(out_fmt==FMT_PERSEUS||out_fmt==FMT_JAGUAR){
         /* Build rcvr chunk. flags field encodes the sample rate index:
          *   0=125k, 1=250k, 2=500k, 3=1000k, 4=2000k (16-bit), 5=Jaguar
-         * rcvr+12 (0x00010000=65536) and rcvr+16 (0x00000101=257) are
-         * constant across all native Perseus rates and must be set. */
+         * Constant fields matching genuine Jaguar/Perseus files:
+         * rcvr bytes 14,15,17 = 0x01 (verified from genuine Jaguar header). */
         RcvrChunk rc; memset(&rc,0,sizeof(rc));
         rc.centre_freq_hz  = (uint32_t)cf_hz;
         if(out_fmt==FMT_JAGUAR){
-            rc.flags = 5;
+            /* flags=5 for native Jaguar 1,600,000 Hz;
+             * flags=4 for 2,000,000 Hz (WavViewDX uses fmt chunk rate for this index) */
+            rc.flags = (sample_rate==2000000) ? 4 : 5;
         } else {
             /* Map sample rate to Perseus rate index */
             rc.flags = (sample_rate<=125000)?0:
@@ -1030,8 +1032,8 @@ static int64_t write_wav_header(FILE *fp,
         }
         rc.unix_timestamp  = (uint32_t)utc_to_unix(sy,sm,sd,sh,smin,ssec);
         /* Set constant fields present in all native Perseus files */
-        rc.padding[2] = 0x01;                          /* rcvr+12 = 0x00010000 */
-        rc.padding[4] = 0x01; rc.padding[5] = 0x01;   /* rcvr+16 = 0x00000101 */
+        rc.padding[2] = 0x01; rc.padding[3] = 0x01;   /* rcvr+14,15 */
+        rc.padding[5] = 0x01;                          /* rcvr+17 */
         fwrite("rcvr",1,4,fp);
         uint32_t rcvr_sz=sizeof(RcvrChunk);
         fwrite(&rcvr_sz,4,1,fp);
@@ -2134,8 +2136,9 @@ static int sdr_process_args(int argc, char *argv[])
     int resamp_target = fs_out;
     if(!do_ddc){
         if(out_fmt==FMT_JAGUAR && rec.sample_rate!=1600000
-           && !(rec.sample_rate==2000000 && rec.fmt==FMT_PERSEUS)){
-            /* Jaguar target rate is 1,600,000 Hz unless this is a 2MHz Perseus→Jaguar */
+           && rec.sample_rate!=2000000){
+            /* Resample to 1,600,000 Hz only when input is not a Jaguar-native rate.
+             * At 1,600,000 and 2,000,000 Hz, pass through directly. */
             need_resamp=1; resamp_target=1600000;
         }
         /* Perseus: no rate conversion — always write at the input sample rate */
@@ -2152,16 +2155,18 @@ static int sdr_process_args(int argc, char *argv[])
                  out_bps_override ? " (user override)" : " (auto)");
     }
 
-    uint64_t out_data_bytes=out_frames*(uint64_t)out_ch*(uint64_t)(out_bps/8);
+    /* Adjust frame count for resampling */
+    uint64_t out_frames_actual = out_frames;
+    if(need_resamp && rec.sample_rate > 0)
+        out_frames_actual = (uint64_t)((double)out_frames * (double)resamp_target
+                             / (double)rec.sample_rate + 0.5);
+    uint64_t out_data_bytes=out_frames_actual*(uint64_t)out_ch*(uint64_t)(out_bps/8);
 
     /* Perseus/Jaguar: check output won't exceed 4GB (no RF64 support) */
     if(out_fmt==FMT_PERSEUS||out_fmt==FMT_JAGUAR){
         uint64_t target_sr = need_resamp ? (uint64_t)resamp_target : (uint64_t)rec.sample_rate;
         uint64_t max_data = 0xFFFFFFFFULL - 86;
-        uint64_t expected_bytes = out_frames*(uint64_t)out_ch*(uint64_t)(out_bps/8);
-        if(need_resamp)
-            expected_bytes=(uint64_t)((double)out_frames*(double)resamp_target
-                            /rec.sample_rate*(uint64_t)out_ch*(uint64_t)(out_bps/8));
+        uint64_t expected_bytes = out_frames_actual*(uint64_t)out_ch*(uint64_t)(out_bps/8);
         if(expected_bytes > max_data){
             proc_log("Error: %s output would exceed 4 GB (%.1f GB).\n"
                      "  Maximum duration at this sample rate: %.0f seconds.\n"
@@ -2175,15 +2180,7 @@ static int sdr_process_args(int argc, char *argv[])
 
     /* Perseus<->Jaguar cross-conversion: only allowed at 2,000,000 Hz (both 16-bit).
      * At other rates the sample rates differ and conversion is not meaningful. */
-    if(!do_ddc &&
-       ((rec.fmt==FMT_PERSEUS && out_fmt==FMT_JAGUAR) ||
-        (rec.fmt==FMT_JAGUAR  && out_fmt==FMT_PERSEUS))){
-        if(rec.sample_rate != 2000000){
-            proc_log("Error: Perseus<->Jaguar conversion only supported at 2,000,000 Hz.\n"
-                     "  Both formats record at 2 MHz and 16-bit at that rate.\n");
-            seq_close(&sr); if(fout) fclose(fout); free(fir_h); return 1;
-        }
-    }
+
 
     /* Warn if SDR Connect output would require RF64 */
     if(out_fmt==FMT_SDRCONNECT){
@@ -2227,7 +2224,8 @@ static int sdr_process_args(int argc, char *argv[])
             /* hdr_sr: for DDC write the decimated rate; for passthrough write the input rate;
              * for resampled Jaguar output write the resampled rate. */
             uint32_t hdr_sr = need_resamp ? (uint32_t)resamp_target : (uint32_t)fs_out;
-            if(out_fmt==FMT_JAGUAR && !do_ddc && !need_resamp) hdr_sr = 1600000;
+            /* Note: hdr_sr is already correct — resamp_target for resampled output,
+             * fs_out (2MHz or 1.6MHz) for passthrough. No override needed. */
             data_sz32_pos=write_wav_header(fout,out_fmt,out_data_bytes,
                 hdr_sr,(uint16_t)out_ch,(uint16_t)out_bps,(int32_t)ddc_cf_hz,
                 out_year,out_month,out_day,trim_sh,trim_sm,trim_ss,
@@ -3009,8 +3007,9 @@ static void update_format_controls(void)
                 CheckRadioButton(g_hwnd,ID_FMT_SAME,ID_FMT_JAGUAR,ID_FMT_SAME);
             EnableWindow(GetDlgItem(g_hwnd,ID_FMT_PERSEUS), FALSE);
         }
-        /* Jaguar output: only allow at Jaguar-native rates */
-        BOOL ok_jag=(fi.sample_rate==1600000||fi.sample_rate==2000000);
+        /* Jaguar output: available at any sample rate (resampler converts to 1,600,000 Hz)
+         * except when DDC is active at a non-Jaguar rate */
+        BOOL ok_jag = !IsDlgButtonChecked(g_hwnd,ID_DDC_CHECK); /* Jaguar available for passthrough at any rate */
         if(!ok_jag){
             if(IsDlgButtonChecked(g_hwnd,ID_FMT_JAGUAR))
                 CheckRadioButton(g_hwnd,ID_FMT_SAME,ID_FMT_JAGUAR,ID_FMT_SAME);
@@ -3233,12 +3232,17 @@ static void update_prediction(void)
             int out_ch = (!IsDlgButtonChecked(g_hwnd,ID_DDC_CHECK) &&
                            IsDlgButtonChecked(g_hwnd,ID_CHAN_DUAL)) ? 4 : 2;
             int out_bps = IsDlgButtonChecked(g_hwnd,ID_OUT_24BIT) ? 24 : 16;
-            uint64_t est_bytes = (uint64_t)eff_secs * (uint64_t)g_sample_rate
+            /* For Jaguar output use the output rate (1,600,000 or 2,000,000) not input rate */
+            int est_sr = g_sample_rate;
+            if(IsDlgButtonChecked(g_hwnd,ID_FMT_JAGUAR) &&
+               g_sample_rate != 1600000 && g_sample_rate != 2000000)
+                est_sr = 1600000;
+            uint64_t est_bytes = (uint64_t)eff_secs * (uint64_t)est_sr
                                  * (uint64_t)out_ch * (uint64_t)(out_bps/8);
             uint64_t max_bytes = 0xFFFFFFFFULL - 128;
             if(est_bytes > max_bytes){
                 double max_secs = (double)max_bytes /
-                                  ((double)g_sample_rate * out_ch * (out_bps/8));
+                                  ((double)est_sr * out_ch * (out_bps/8));
 g_outfile_warn = TRUE;
                 wcscat(label, L"  ⚠ Exceeds 4 GB limit");
                 wchar_t warn[64];

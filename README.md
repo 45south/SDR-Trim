@@ -2,9 +2,6 @@
 
 IQ recording utility for SDRplay RSPdx, RSPduo, Perseus, and Jaguar receivers.
 
-**NOTE: This is Beta software and is under constant development. Please report any bugs.**
-
-
 **Trim · Convert · Extract · DDC**
 
 ## Features
@@ -29,7 +26,7 @@ IQ recording utility for SDRplay RSPdx, RSPduo, Perseus, and Jaguar receivers.
 | SDRuno WAV | .wav | 2 MHz, single tuner |
 | SDR Connect WAV | .wav | Single tuner |
 | Perseus WAV | .wav | 24-bit at 125k–1,000k Hz; 16-bit at 2,000k Hz |
-| Jaguar WAV | .wav | 1,600,000 Hz, single tuner |
+| Jaguar WAV | .wav | 1,600,000 Hz and 2,000,000 Hz, single tuner |
 
 ## Building
 
