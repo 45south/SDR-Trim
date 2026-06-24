@@ -79,6 +79,8 @@
 #define ID_CLEAR_BATCH      132
 #define ID_BATCH_LIST       133
 #define ID_BATCH_LABEL      134
+#define ID_SHOW_QUEUE       148
+#define ID_BATCH_STATUS     149
 #define ID_LOG_GROUP        135
 
 /* Custom messages */
@@ -2084,9 +2086,19 @@ static int sdr_process_args(int argc, char *argv[])
                 /* SendMessage is synchronous — blocks until user responds */
                 LRESULT r=SendMessageW(g_proc_hwnd,WM_CONFIRM_OW,0,(LPARAM)wpath);
                 /* wpath is freed by the handler */
-                if(r!=IDYES){
-                    proc_log("Cancelled — output file already exists.\n");
-                    fclose(fin); free(fir_h); return 1;
+                if(r==IDRETRY){
+                    /* Auto-rename: insert (1),(2)... before extension */
+                    char base[512], ext[32]=""; int n=1;
+                    char *dot=strrchr(outpath,'.');
+                    if(dot){ strncpy(ext,dot,31); *dot='\0'; }
+                    strncpy(base,outpath,511);
+                    do {
+                        snprintf(outpath,512,"%s (%d)%s",base,n++,ext);
+                    } while(n<100 && (ftest=fopen(outpath,"rb")) && !fclose(ftest));
+                    proc_log("Renamed output: %s\n",outpath);
+                } else if(r!=IDYES){
+                    proc_log("Skipped — output file already exists.\n");
+                    fclose(fin); free(fir_h); return 1; /* 1 = skip, batch continues */
                 }
             }
         }
@@ -2320,7 +2332,7 @@ write_error:
 /* ------------------------------------------------------------------ */
 /*  Colours                                                            */
 /* ------------------------------------------------------------------ */
-#define CLR_HEADER_BG   RGB(45,  45,  48)
+#define CLR_HEADER_BG   RGB(10,  36,  99)
 #define CLR_HEADER_TEXT RGB(240, 240, 240)
 #define CLR_RUN_BG      RGB(0,   158, 87 )   /* green  — idle, click to Run */
 #define CLR_RUN_HOT     RGB(0,   134, 74 )
@@ -2354,6 +2366,7 @@ typedef struct {
 /*  Globals                                                            */
 /* ------------------------------------------------------------------ */
 static HWND      g_hwnd;
+static HWND      g_hwnd_batch = NULL;  /* batch queue window */
 static int       g_sample_rate = 0;  /* sample rate of currently loaded file */
 static int       g_fi_fmt      = -1; /* format of currently loaded file */
 static wchar_t   g_out_folder[MAX_PATH] = {0}; /* custom output folder, or empty for same as input */
@@ -2960,13 +2973,23 @@ static void update_channel_controls(void)
 
 static void update_run_batch_button(void)
 {
-    if(g_running){ EnableWindow(GetDlgItem(g_hwnd,ID_RUN_BATCH),FALSE); return; }
+    if(!g_hwnd_batch) return;
     BOOL any_runnable=FALSE;
     for(int i=0;i<g_job_count;i++){
         if(wcscmp(g_jobs[i].status,L"Done")!=0)
             { any_runnable=TRUE; break; }
     }
-    EnableWindow(GetDlgItem(g_hwnd,ID_RUN_BATCH), any_runnable && g_job_count>0);
+    BOOL run_batch_enabled = !g_running && any_runnable && g_job_count>0;
+    EnableWindow(GetDlgItem(g_hwnd_batch,ID_RUN_BATCH), run_batch_enabled);
+    InvalidateRect(GetDlgItem(g_hwnd_batch,ID_RUN_BATCH),NULL,FALSE);
+    /* Grey out main Run button when batch has pending jobs */
+    BOOL has_pending = FALSE;
+    for(int i=0;i<g_job_count;i++){
+        if(wcscmp(g_jobs[i].status,L"Pending")==0)
+            { has_pending=TRUE; break; }
+    }
+    EnableWindow(GetDlgItem(g_hwnd,ID_RUN), !has_pending && !g_running);
+    InvalidateRect(GetDlgItem(g_hwnd,ID_RUN),NULL,FALSE);
 }
 
 
@@ -3288,7 +3311,7 @@ g_outfile_warn = TRUE;
 /* ------------------------------------------------------------------ */
 static void batch_list_refresh_row(int idx)
 {
-    HWND hlv=GetDlgItem(g_hwnd,ID_BATCH_LIST);
+    HWND hlv=GetDlgItem(g_hwnd_batch,ID_BATCH_LIST);
     wchar_t num[8]; _snwprintf(num,8,L"%d",idx+1);
     LVITEMW li; ZeroMemory(&li,sizeof(li));
     li.mask=LVIF_TEXT; li.iItem=idx;
@@ -3301,7 +3324,7 @@ static void batch_list_refresh_row(int idx)
 
 static void batch_list_add_row(int idx)
 {
-    HWND hlv=GetDlgItem(g_hwnd,ID_BATCH_LIST);
+    HWND hlv=GetDlgItem(g_hwnd_batch,ID_BATCH_LIST);
     LVITEMW li; ZeroMemory(&li,sizeof(li));
     li.mask=LVIF_TEXT; li.iItem=idx; li.iSubItem=0;
     wchar_t num[8]; _snwprintf(num,8,L"%d",idx+1);
@@ -3313,11 +3336,15 @@ static void batch_list_add_row(int idx)
 static void batch_list_set_status(int idx,const wchar_t *status)
 {
     wcsncpy(g_jobs[idx].status,status,31);
-    HWND hlv=GetDlgItem(g_hwnd,ID_BATCH_LIST);
+    HWND hlv=GetDlgItem(g_hwnd_batch,ID_BATCH_LIST);
+    if(!hlv) return;
     LVITEMW li; ZeroMemory(&li,sizeof(li));
     li.mask=LVIF_TEXT; li.iItem=idx; li.iSubItem=COL_STATUS;
     li.pszText=(wchar_t*)status;
     ListView_SetItem(hlv,&li);
+    /* Force full row repaint so custom draw colours update */
+    ListView_RedrawItems(hlv,idx,idx);
+    UpdateWindow(hlv);
 }
 
 /* ------------------------------------------------------------------ */
@@ -3425,6 +3452,9 @@ static DWORD WINAPI batch_thread(LPVOID param)
             _snwprintf(done2,64,L"Job %d cancelled.\r\n\r\n",i+1);
             PostMessageW(g_hwnd,WM_APPENDLOG,0,(LPARAM)_wcsdup(done2));
             break;
+        } else if(ec==1){
+            /* Skipped (file exists, user chose Skip) — continue batch */
+            PostMessageW(g_hwnd,WM_BATCHSTATUS,(WPARAM)i,(LPARAM)_wcsdup(L"Skipped"));
         } else if(ec==(DWORD)-1 || ec!=0){
             const wchar_t *st=L"Failed";
             if(!g_batch_run){
@@ -3440,7 +3470,8 @@ static DWORD WINAPI batch_thread(LPVOID param)
         }
 
         wchar_t done[64];
-        _snwprintf(done,64,L"Job %d %s.\r\n\r\n",i+1,ec==0?L"completed":L"failed");
+        _snwprintf(done,64,L"Job %d %s.\r\n\r\n",i+1,
+            ec==0?L"completed":ec==1?L"skipped":L"failed");
         PostMessageW(g_hwnd,WM_APPENDLOG,0,(LPARAM)_wcsdup(done));
     }
     PostMessageW(g_hwnd,WM_BATCHDONE,0,0);
@@ -3491,23 +3522,33 @@ static void draw_progress_bar(DRAWITEMSTRUCT *di)
 /* ------------------------------------------------------------------ */
 static void draw_run_button(DRAWITEMSTRUCT *di)
 {
-    BOOL pressed=(di->itemState&ODS_SELECTED)!=0;
-    COLORREF bg_normal, bg_hot;
+    BOOL disabled=(di->itemState&ODS_DISABLED)!=0;
+    BOOL pressed =(di->itemState&ODS_SELECTED)!=0;
+    COLORREF bg, txt, border;
     const wchar_t *label;
-    if(!g_running)      { bg_normal=CLR_RUN_BG;    bg_hot=CLR_RUN_HOT;    label=L"Run";    }
-    else if(g_pause)    { bg_normal=CLR_RESUME_BG; bg_hot=CLR_RESUME_HOT; label=L"Resume"; }
-    else                { bg_normal=CLR_PAUSE_BG;  bg_hot=CLR_PAUSE_HOT;  label=L"Pause";  }
-    COLORREF bg=pressed?bg_hot:bg_normal;
+    if(disabled){
+        bg=RGB(229,229,229); txt=RGB(160,160,160); border=RGB(180,180,180);
+        label=L"Run";
+    } else if(!g_running){
+        bg=pressed?CLR_RUN_HOT:CLR_RUN_BG; txt=CLR_RUN_TEXT;
+        border=RGB(0,84,153); label=L"Run";
+    } else if(g_pause){
+        bg=pressed?CLR_RESUME_HOT:CLR_RESUME_BG; txt=CLR_RUN_TEXT;
+        border=RGB(0,84,153); label=L"Resume";
+    } else {
+        bg=pressed?CLR_PAUSE_HOT:CLR_PAUSE_BG; txt=CLR_RUN_TEXT;
+        border=RGB(140,80,0); label=L"Pause";
+    }
     HBRUSH hbr=CreateSolidBrush(bg);
     FillRect(di->hDC,&di->rcItem,hbr); DeleteObject(hbr);
-    HPEN hp=CreatePen(PS_SOLID,1,RGB(0,84,153));
+    HPEN hp=CreatePen(PS_SOLID,1,border);
     HPEN op=(HPEN)SelectObject(di->hDC,hp);
     HBRUSH ob=(HBRUSH)SelectObject(di->hDC,GetStockObject(NULL_BRUSH));
     RECT r=di->rcItem; r.right--; r.bottom--;
     Rectangle(di->hDC,r.left,r.top,r.right,r.bottom);
     SelectObject(di->hDC,op); SelectObject(di->hDC,ob); DeleteObject(hp);
     SetBkMode(di->hDC,TRANSPARENT);
-    SetTextColor(di->hDC,CLR_RUN_TEXT);
+    SetTextColor(di->hDC,txt);
     if(g_font_bold) SelectObject(di->hDC,g_font_bold);
     DrawTextW(di->hDC,label,-1,&di->rcItem,DT_CENTER|DT_VCENTER|DT_SINGLELINE);
     if(di->itemState&ODS_FOCUS){ RECT fr=di->rcItem; InflateRect(&fr,-3,-3); DrawFocusRect(di->hDC,&fr); }
@@ -3649,7 +3690,7 @@ static void create_controls(HWND hwnd)
     g_font_title=CreateFontW(-20,0,0,0,FW_LIGHT,0,0,0,DEFAULT_CHARSET,0,0,CLEARTYPE_QUALITY,DEFAULT_PITCH,L"Segoe UI");
 
     RECT cr; GetClientRect(hwnd,&cr);
-    int W=cr.right, H=cr.bottom;
+    int W=cr.right; (void)cr.bottom;
     int M=12, y=g_header_h+14;
 
     /* ── Input ── */
@@ -3742,7 +3783,7 @@ static void create_controls(HWND hwnd)
     y+=26;
 
     /* ── Log ── */
-    int log_h=120;
+    int log_h=90;
     { HWND hg=mk_group(hwnd,L"Output Log",M,y,W-M*2,log_h+22);
       SetWindowLongW(hg,GWLP_ID,ID_LOG_GROUP); }
     mk_edit(hwnd,ID_LOG_EDIT,M+8,y+20,W-M*2-16,log_h,TRUE,TRUE);
@@ -3769,42 +3810,9 @@ static void create_controls(HWND hwnd)
     y+=38;
 
     /* ── Batch section ── */
-    /* Separator label */
     mk_static(hwnd,L"Batch Jobs",M,y+4,90,18);
-    mk_btn(hwnd,ID_ADD_BATCH,  L"Add to Batch",W-M-280,y,96,26,BS_PUSHBUTTON);
-    mk_btn(hwnd,ID_RUN_BATCH,  L"Run Batch",   W-M-176,y,86,26,BS_PUSHBUTTON);
-    mk_btn(hwnd,ID_CLEAR_BATCH,L"Clear All",   W-M-82, y,70,26,BS_PUSHBUTTON);
-    y+=34;
-
-    /* ── Batch ListView ── */
-    int lv_h=H-M-y;
-    if(lv_h<80) lv_h=80;
-    HWND hlv=CreateWindowExW(WS_EX_CLIENTEDGE,WC_LISTVIEWW,L"",
-        WS_CHILD|WS_VISIBLE|WS_TABSTOP|
-        LVS_REPORT|LVS_SINGLESEL|LVS_SHOWSELALWAYS|LVS_NOSORTHEADER,
-        M,y,W-M*2,lv_h,
-        hwnd,(HMENU)(INT_PTR)ID_BATCH_LIST,g_hinst,NULL);
-    SendMessageW(hlv,WM_SETFONT,(WPARAM)g_font,FALSE);
-    ListView_SetExtendedListViewStyle(hlv,LVS_EX_FULLROWSELECT|LVS_EX_GRIDLINES);
-
-    /* Columns */
-    LVCOLUMNW lc; ZeroMemory(&lc,sizeof(lc)); lc.mask=LVCF_TEXT|LVCF_WIDTH|LVCF_SUBITEM;
-    /* Default column widths — overridden by saved values below */
-    int def_cw[]={30,140,170,140,80};
-    /* Load saved widths from INI if available */
-    wchar_t ini_pth[MAX_PATH]; ini_path(ini_pth,MAX_PATH);
-    for(int col=0;col<5;col++){
-        wchar_t key[16]; _snwprintf(key,16,L"col%d",col);
-        int saved=(int)GetPrivateProfileIntW(L"Cols",key,-1,ini_pth);
-        if(saved>10) def_cw[col]=saved;
-    }
-    const wchar_t *col_names[]={L"#",L"Input",L"Operation",L"Output",L"Status"};
-    int col_ids[]={COL_NUM,COL_INPUT,COL_OP,COL_OUTPUT,COL_STATUS};
-    for(int col=0;col<5;col++){
-        lc.cx=def_cw[col]; lc.pszText=(wchar_t*)col_names[col];
-        lc.iSubItem=col_ids[col];
-        ListView_InsertColumn(hlv,col_ids[col],&lc);
-    }
+    mk_btn(hwnd,ID_ADD_BATCH,   L"Add to Batch", M+100,y,96,26,BS_PUSHBUTTON);
+    mk_btn(hwnd,ID_SHOW_QUEUE,  L"Show Queue",   M+204,y,90,26,BS_PUSHBUTTON);
 
     /* ── Initial state ── */
     CheckRadioButton(hwnd,ID_MODE_FULL,ID_MODE_TRIM,ID_MODE_FULL);
@@ -3864,6 +3872,257 @@ static void browse_file(void)
 }
 
 /* ------------------------------------------------------------------ */
+/*  Overwrite / Rename dialog                                          */
+/* ------------------------------------------------------------------ */
+/* Overwrite dialog state */
+static int      g_ow_result;
+static wchar_t  g_ow_msg[MAX_PATH+80];
+
+static INT_PTR CALLBACK ow_dlg_proc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp)
+{
+    (void)lp;
+    switch(msg){
+    case WM_INITDIALOG:
+        SetDlgItemTextW(hwnd,100,g_ow_msg);
+        return TRUE;
+    case WM_COMMAND:
+        switch(LOWORD(wp)){
+        case 101: g_ow_result=IDYES;   EndDialog(hwnd,0); break; /* Overwrite */
+        case 102: g_ow_result=IDRETRY; EndDialog(hwnd,0); break; /* Rename    */
+        case 103: g_ow_result=IDNO;    EndDialog(hwnd,0); break; /* Skip      */
+        case IDCANCEL: g_ow_result=IDNO; EndDialog(hwnd,0); break;
+        }
+        return TRUE;
+    }
+    return FALSE;
+}
+
+/* Append wide string to dialog buffer */
+static WORD *ow_wstr(WORD *p, const wchar_t *s){ while(*s)*p++=(WORD)*s++;*p++=0;return p; }
+
+/* Append DWORD-aligned dialog item */
+static WORD *ow_item(WORD *p,BYTE *base,
+    short x,short y,short cx,short cy,
+    WORD id,WORD cls,DWORD sty,const wchar_t *txt)
+{
+    if((size_t)((BYTE*)p-base)&2)p++;
+    DLGITEMTEMPLATE *di=(DLGITEMTEMPLATE*)p;
+    di->style=WS_CHILD|WS_VISIBLE|sty; di->dwExtendedStyle=0;
+    di->x=x;di->y=y;di->cx=cx;di->cy=cy;di->id=id;
+    p=(WORD*)(di+1);
+    *p++=0xFFFF;*p++=cls;
+    p=ow_wstr(p,txt);
+    *p++=0;
+    return p;
+}
+
+static int show_ow_dialog(HWND parent, const wchar_t *path)
+{
+    wchar_t *fn=wcsrchr(path,L'\\');
+    _snwprintf(g_ow_msg,MAX_PATH+80,
+        L"Output file already exists:\n\n%s\n\nChoose an action:",
+        fn?fn+1:path);
+
+    static WORD buf[512];
+    ZeroMemory(buf,sizeof(buf));
+    DLGTEMPLATE *dt=(DLGTEMPLATE*)buf;
+    dt->style=DS_MODALFRAME|DS_CENTER|DS_SETFONT|WS_POPUP|WS_CAPTION|WS_SYSMENU;
+    dt->dwExtendedStyle=0;
+    dt->cdit=4;dt->x=0;dt->y=0;dt->cx=220;dt->cy=80;
+    WORD *p=(WORD*)(dt+1);
+    *p++=0;*p++=0;
+    p=ow_wstr(p,L"SDR Trim — File Exists");
+    *p++=9;
+    p=ow_wstr(p,L"Segoe UI");
+
+    BYTE *base=(BYTE*)buf;
+    p=ow_item(p,base,  7, 7,206,28,100,0x0082,SS_LEFT|SS_NOPREFIX,       g_ow_msg);
+    p=ow_item(p,base,  7,54, 60,14,101,0x0080,BS_PUSHBUTTON|WS_TABSTOP,  L"Overwrite");
+    p=ow_item(p,base, 75,54, 60,14,102,0x0080,BS_DEFPUSHBUTTON|WS_TABSTOP,L"Rename");
+    p=ow_item(p,base,143,54, 60,14,103,0x0080,BS_PUSHBUTTON|WS_TABSTOP,  L"Skip");
+
+    g_ow_result=IDNO;
+    DialogBoxIndirectW(g_hinst,dt,parent,ow_dlg_proc);
+    return g_ow_result;
+}
+
+/* ------------------------------------------------------------------ */
+/*  Batch Queue Window                                                 */
+/* ------------------------------------------------------------------ */
+static LRESULT CALLBACK batch_wnd_proc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp)
+{
+    switch(msg){
+    case WM_CREATE:{
+        HWND hlv=CreateWindowExW(WS_EX_CLIENTEDGE,WC_LISTVIEWW,L"",
+            WS_CHILD|WS_VISIBLE|WS_TABSTOP|
+            LVS_REPORT|LVS_SINGLESEL|LVS_SHOWSELALWAYS|LVS_NOSORTHEADER,
+            8,8,600,300,hwnd,(HMENU)(INT_PTR)ID_BATCH_LIST,g_hinst,NULL);
+        SendMessageW(hlv,WM_SETFONT,(WPARAM)g_font,FALSE);
+        ListView_SetExtendedListViewStyle(hlv,LVS_EX_FULLROWSELECT|LVS_EX_GRIDLINES);
+        LVCOLUMNW lc; ZeroMemory(&lc,sizeof(lc)); lc.mask=LVCF_TEXT|LVCF_WIDTH|LVCF_SUBITEM;
+        int def_cw[]={30,160,190,160,80};
+        wchar_t ini_pth[MAX_PATH]; ini_path(ini_pth,MAX_PATH);
+        for(int col=0;col<5;col++){
+            wchar_t key[16]; _snwprintf(key,16,L"col%d",col);
+            int saved=(int)GetPrivateProfileIntW(L"Cols",key,-1,ini_pth);
+            if(saved>10) def_cw[col]=saved;
+        }
+        const wchar_t *col_names[]={L"#",L"Input",L"Operation",L"Output",L"Status"};
+        int col_ids[]={COL_NUM,COL_INPUT,COL_OP,COL_OUTPUT,COL_STATUS};
+        for(int col=0;col<5;col++){
+            lc.cx=def_cw[col]; lc.pszText=(wchar_t*)col_names[col];
+            lc.iSubItem=col_ids[col];
+            ListView_InsertColumn(hlv,col_ids[col],&lc);
+        }
+        mk_btn(hwnd,ID_RUN_BATCH,   L"Run Batch",  8,  316, 100, 28, BS_OWNERDRAW);
+        mk_btn(hwnd,ID_CLEAR_BATCH, L"Clear All",  116, 316, 90,  28, BS_PUSHBUTTON);
+        SendMessageW(GetDlgItem(hwnd,ID_RUN_BATCH),   WM_SETFONT,(WPARAM)g_font,FALSE);
+        SendMessageW(GetDlgItem(hwnd,ID_CLEAR_BATCH), WM_SETFONT,(WPARAM)g_font,FALSE);
+        for(int i=0;i<g_job_count;i++) batch_list_add_row(i);
+        update_run_batch_button();
+        return 0;}
+
+    case WM_SIZE:{
+        int W2=LOWORD(lp),H2=HIWORD(lp);
+        int btn_h=28,btn_y=H2-btn_h-8;
+        if(btn_y<8) btn_y=8;
+        SetWindowPos(GetDlgItem(hwnd,ID_BATCH_LIST),NULL,
+            8,8,W2-16,btn_y-16,SWP_NOZORDER);
+        SetWindowPos(GetDlgItem(hwnd,ID_RUN_BATCH),NULL,
+            8,btn_y,100,btn_h,SWP_NOZORDER);
+        SetWindowPos(GetDlgItem(hwnd,ID_CLEAR_BATCH),NULL,
+            116,btn_y,90,btn_h,SWP_NOZORDER);
+        return 0;}
+
+    case WM_COMMAND:
+        switch(LOWORD(wp)){
+        case ID_RUN_BATCH:
+            SendMessageW(g_hwnd,WM_COMMAND,
+                MAKEWPARAM(ID_RUN_BATCH,BN_CLICKED),
+                (LPARAM)GetDlgItem(g_hwnd,ID_RUN_BATCH));
+            break;
+        case ID_CLEAR_BATCH:
+            SendMessageW(g_hwnd,WM_COMMAND,
+                MAKEWPARAM(ID_CLEAR_BATCH,BN_CLICKED),
+                (LPARAM)GetDlgItem(g_hwnd,ID_CLEAR_BATCH));
+            break;
+        }
+        return 0;
+
+    case WM_NOTIFY:{
+        NMHDR *nm=(NMHDR*)lp;
+        if(nm->idFrom==ID_BATCH_LIST && nm->code==NM_CUSTOMDRAW){
+            NMLVCUSTOMDRAW *cd=(NMLVCUSTOMDRAW*)lp;
+            if(cd->nmcd.dwDrawStage==CDDS_PREPAINT)
+                return CDRF_NOTIFYITEMDRAW;
+            if(cd->nmcd.dwDrawStage==CDDS_ITEMPREPAINT)
+                return CDRF_NOTIFYSUBITEMDRAW;
+            if(cd->nmcd.dwDrawStage==(CDDS_ITEMPREPAINT|CDDS_SUBITEM)){
+                int idx=(int)cd->nmcd.dwItemSpec;
+                if(idx>=0 && idx<g_job_count){
+                    const wchar_t *st=g_jobs[idx].status;
+                    if(wcscmp(st,L"Done")==0){
+                        cd->clrTextBk=RGB(220,245,220);
+                        cd->clrText=RGB(0,120,0);
+                    } else if(wcscmp(st,L"Running")==0){
+                        cd->clrTextBk=RGB(220,235,255);
+                        cd->clrText=RGB(0,70,180);
+                    } else if(wcscmp(st,L"Pending")==0){
+                        cd->clrTextBk=RGB(255,250,220);
+                        cd->clrText=RGB(140,90,0);
+                    } else if(wcscmp(st,L"Skipped")==0){
+                        cd->clrTextBk=RGB(235,235,235);
+                        cd->clrText=RGB(100,100,100);
+                    } else if(wcscmp(st,L"Failed")==0||
+                               wcscmp(st,L"Cancelled")==0){
+                        cd->clrTextBk=RGB(255,225,225);
+                        cd->clrText=RGB(180,0,0);
+                    }
+                }
+                return CDRF_NEWFONT;
+            }
+            return CDRF_DODEFAULT;
+        }
+        if(nm->idFrom==ID_BATCH_LIST && nm->code==NM_RCLICK){
+            HWND hlv=GetDlgItem(hwnd,ID_BATCH_LIST);
+            int sel=(int)SendMessageW(hlv,LVM_GETNEXTITEM,(WPARAM)-1,LVNI_SELECTED);
+            if(sel>=0 && !g_running){
+                ListView_DeleteItem(hlv,sel);
+                for(int i=sel;i<g_job_count-1;i++) g_jobs[i]=g_jobs[i+1];
+                g_job_count--;
+                for(int i=sel;i<g_job_count;i++) batch_list_refresh_row(i);
+                update_run_batch_button();
+            }
+        }
+        if(nm->idFrom==ID_BATCH_LIST &&
+           (nm->code==LVN_COLUMNCLICK||nm->code==(UINT)HDN_ENDTRACKW)){
+            HWND hlv=GetDlgItem(hwnd,ID_BATCH_LIST);
+            wchar_t ini_pth[MAX_PATH]; ini_path(ini_pth,MAX_PATH);
+            for(int col=0;col<5;col++){
+                wchar_t key[16]; _snwprintf(key,16,L"col%d",col);
+                int w=(int)SendMessageW(hlv,LVM_GETCOLUMNWIDTH,col,0);
+                wchar_t val[16]; _snwprintf(val,16,L"%d",w);
+                WritePrivateProfileStringW(L"Cols",key,val,ini_pth);
+            }
+        }
+        return 0;}
+
+    case WM_DRAWITEM:{
+        DRAWITEMSTRUCT *di=(DRAWITEMSTRUCT*)lp;
+        if(di->CtlID==ID_RUN_BATCH){
+            BOOL en=IsWindowEnabled(di->hwndItem);
+            BOOL hot=(di->itemState&ODS_HOTLIGHT)!=0;
+            COLORREF bg = en ? (hot ? CLR_RUN_HOT : CLR_RUN_BG) : RGB(180,180,180);
+            COLORREF fg = en ? CLR_RUN_TEXT : RGB(100,100,100);
+            HBRUSH hbr=CreateSolidBrush(bg);
+            FillRect(di->hDC,&di->rcItem,hbr);
+            DeleteObject(hbr);
+            SetTextColor(di->hDC,fg);
+            SetBkMode(di->hDC,TRANSPARENT);
+            if(g_font) SelectObject(di->hDC,g_font_bold?g_font_bold:g_font);
+            DrawTextW(di->hDC,L"Run Batch",-1,&di->rcItem,
+                DT_CENTER|DT_VCENTER|DT_SINGLELINE);
+        }
+        return TRUE;}
+
+    case WM_CLOSE:
+        ShowWindow(hwnd,SW_HIDE);
+        return 0;
+    }
+    return DefWindowProcW(hwnd,msg,wp,lp);
+}
+
+static void show_batch_window(void)
+{
+    if(!g_hwnd_batch){
+        static BOOL reg=FALSE;
+        if(!reg){
+            WNDCLASSEXW wc={0};
+            wc.cbSize=sizeof(wc);
+            wc.lpfnWndProc=batch_wnd_proc;
+            wc.hInstance=g_hinst;
+            wc.hCursor=LoadCursorW(NULL,IDC_ARROW);
+            wc.hbrBackground=(HBRUSH)(COLOR_BTNFACE+1);
+            wc.lpszClassName=L"SDRTrimBatchWnd";
+            wc.hIcon=LoadIconW(NULL,IDI_APPLICATION);
+            RegisterClassExW(&wc);
+            reg=TRUE;
+        }
+        g_hwnd_batch=CreateWindowExW(0,
+            L"SDRTrimBatchWnd",L"SDR Trim — Batch Queue",
+            WS_POPUP|WS_CAPTION|WS_SYSMENU|WS_SIZEBOX|WS_VISIBLE,
+            0,0,660,380,g_hwnd,NULL,g_hinst,NULL);
+        RECT mr; GetWindowRect(g_hwnd,&mr);
+        SetWindowPos(g_hwnd_batch,HWND_TOP,mr.right+8,mr.top,660,380,SWP_NOSIZE);
+        update_run_batch_button(); /* g_hwnd_batch now valid */
+    } else {
+        ShowWindow(g_hwnd_batch,SW_SHOW);
+        SetWindowPos(g_hwnd_batch,HWND_TOP,0,0,0,0,SWP_NOMOVE|SWP_NOSIZE);
+        SetForegroundWindow(g_hwnd_batch);
+    }
+}
+
+/* ------------------------------------------------------------------ */
 /*  Window procedure                                                  */
 /* ------------------------------------------------------------------ */
 
@@ -3897,7 +4156,7 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp)
         }
         /* Resize: reposition/resize stretchy controls */
         if(wp==SIZE_MINIMIZED) return 0;
-        int W=LOWORD(lp), H=HIWORD(lp);
+        int W=LOWORD(lp), H=HIWORD(lp); (void)H;
         int M=12;
         HDWP hdwp=BeginDeferWindowPos(16);
         #define MV(id,x,y,w,h) \
@@ -3922,7 +4181,7 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp)
         MV(ID_OUTFILE_STATIC, M+2,  538,  W-M*2-4, 18)
 
         /* Log group + edit stretch */
-        int log_top = 564;
+        int log_top = 534;
         int log_group_h = 120;
         MV(ID_LOG_EDIT,   M+8,      log_top+20, W-M*2-16, log_group_h)
         MV(ID_LOG_GROUP,  M,        log_top,    W-M*2,    log_group_h+22)
@@ -3939,17 +4198,10 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp)
         MV(ID_CANCEL, W-M-170, btn_y, 78, 28)
         MV(ID_CLEAR,  W-M-84,  btn_y, 78, 28)
 
-        /* Batch toolbar buttons move right */
+        /* Batch toolbar — just Add and Show Queue */
         int batch_hdr_y=btn_y+38;
-        MV(ID_ADD_BATCH,   W-M-274, batch_hdr_y, 90, 26)
-        MV(ID_RUN_BATCH,   W-M-176, batch_hdr_y, 86, 26)
-        MV(ID_CLEAR_BATCH, W-M-82,  batch_hdr_y, 70, 26)
-
-        /* Batch list stretches both ways */
-        int lv_y=batch_hdr_y+34;
-        int lv_h=H-M-lv_y;
-        if(lv_h<80) lv_h=80;
-        MV(ID_BATCH_LIST, M, lv_y, W-M*2, lv_h)
+        MV(ID_ADD_BATCH,  M+100, batch_hdr_y, 96, 26)
+        MV(ID_SHOW_QUEUE, M+204, batch_hdr_y, 90, 26)
 
         /* Header panel stretches */
         MV(ID_HEADER_PANEL, 0, 0, W, g_header_h)
@@ -4004,7 +4256,7 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp)
             SetTextColor(di->hDC,CLR_HEADER_TEXT);
             if(g_font_title) SelectObject(di->hDC,g_font_title);
             RECT tr=di->rcItem; tr.left+=14;
-            DrawTextW(di->hDC,L"SDR Trim  v1.5.5",-1,&tr,DT_LEFT|DT_VCENTER|DT_SINGLELINE);
+            DrawTextW(di->hDC,L"SDR Trim  v1.6.0",-1,&tr,DT_LEFT|DT_VCENTER|DT_SINGLELINE);
             /* Name on right — use normal font, slightly smaller */
             if(g_font) SelectObject(di->hDC,g_font);
             RECT nr=di->rcItem; nr.right-=14;
@@ -4227,6 +4479,10 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp)
 
         case ID_CLEAR: log_clear(); break;
 
+        case ID_SHOW_QUEUE:
+            show_batch_window();
+            break;
+
         case ID_ADD_BATCH:
             if(g_job_count>=MAX_JOBS){
                 MessageBoxW(hwnd,L"Batch list is full (64 jobs maximum).",
@@ -4252,6 +4508,7 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp)
                     wcsncpy(j->output_short,L"(unknown)",63);
                     j->output_full[0]=L'\0';
                 }
+                show_batch_window();
                 batch_list_add_row(g_job_count);
                 g_job_count++;
                 update_run_batch_button();
@@ -4283,9 +4540,12 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp)
                 if(conflict_count>0){
                     wchar_t msg[4096+128];
                     _snwprintf(msg,4096+128,
-                        L"%d output file(s) already exist and will be overwritten:\n\n%s\nContinue?",
+                        L"%d output file(s) already exist:\n\n%s\n"
+                        L"These files may be overwritten during processing.\n"
+                        L"You can choose Overwrite, Rename, or Skip for each file when it is reached.\n\n"
+                        L"Start the batch?",
                         conflict_count,conflict_list);
-                    if(MessageBoxW(hwnd,msg,L"SDR Trim Batch - Overwrite?",
+                    if(MessageBoxW(hwnd,msg,L"SDR Trim — Batch Conflicts",
                             MB_YESNO|MB_ICONWARNING|MB_DEFBUTTON2)!=IDYES) break;
                 }
                 /* Reset all Pending/Cancelled jobs */
@@ -4299,7 +4559,7 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp)
                 g_batch_run=TRUE;
                 g_pause=FALSE;
                 InvalidateRect(GetDlgItem(hwnd,ID_RUN),NULL,FALSE);
-                EnableWindow(GetDlgItem(hwnd,ID_RUN_BATCH),FALSE);
+                if(g_hwnd_batch) EnableWindow(GetDlgItem(g_hwnd_batch,ID_RUN_BATCH),FALSE);
                 EnableWindow(GetDlgItem(hwnd,ID_CANCEL),TRUE);
                 InvalidateRect(GetDlgItem(hwnd,ID_CANCEL),NULL,FALSE);
                 SetWindowTextW(GetDlgItem(hwnd,ID_PCT_STATIC),L"");
@@ -4311,7 +4571,8 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp)
         case ID_CLEAR_BATCH:
             if(g_running) break;
             g_job_count=0;
-            ListView_DeleteAllItems(GetDlgItem(hwnd,ID_BATCH_LIST));
+            if(g_hwnd_batch)
+                ListView_DeleteAllItems(GetDlgItem(g_hwnd_batch,ID_BATCH_LIST));
             update_run_batch_button();
             break;
         }
@@ -4320,32 +4581,6 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp)
     /* Right-click context menu on batch list */
     case WM_NOTIFY:{
         NMHDR *nm=(NMHDR*)lp;
-        if(nm->idFrom==ID_BATCH_LIST&&nm->code==NM_CUSTOMDRAW){
-            NMLVCUSTOMDRAW *cd=(NMLVCUSTOMDRAW*)lp;
-            if(cd->nmcd.dwDrawStage==CDDS_PREPAINT)
-                return CDRF_NOTIFYITEMDRAW;
-            if(cd->nmcd.dwDrawStage==CDDS_ITEMPREPAINT)
-                return CDRF_NOTIFYSUBITEMDRAW;
-            if(cd->nmcd.dwDrawStage==(CDDS_ITEMPREPAINT|CDDS_SUBITEM)){
-                if(cd->iSubItem==COL_STATUS){
-                    int idx=(int)cd->nmcd.dwItemSpec;
-                    if(idx>=0&&idx<g_job_count){
-                        const wchar_t *st=g_jobs[idx].status;
-                        if(wcscmp(st,L"Done")==0){
-                            cd->clrText=RGB(0,140,0);
-                        } else if(wcscmp(st,L"Pending")==0){
-                            cd->clrText=RGB(160,100,0);
-                        } else if(wcscmp(st,L"Running")==0){
-                            cd->clrText=RGB(0,80,180);
-                        } else if(wcscmp(st,L"Failed")==0||
-                                  wcscmp(st,L"Cancelled")==0){
-                            cd->clrText=RGB(180,0,0);
-                        }
-                    }
-                }
-                return CDRF_NEWFONT;
-            }
-        }
         if(nm->idFrom==ID_BATCH_LIST&&nm->code==NM_RCLICK){
             NMITEMACTIVATE *nia=(NMITEMACTIVATE*)lp;
             int idx=nia->iItem;
@@ -4385,8 +4620,8 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp)
         if(wp==0&&lp){ log_append((wchar_t*)lp); free((void*)lp); }
         else if(wp==1){
             g_running=FALSE; g_pause=FALSE; g_hprocess=NULL;
-            EnableWindow(GetDlgItem(hwnd,ID_RUN),TRUE);
             EnableWindow(GetDlgItem(hwnd,ID_CANCEL),FALSE);
+            update_run_batch_button();
             InvalidateRect(GetDlgItem(hwnd,ID_CANCEL),NULL,FALSE);
             SetWindowTextW(GetDlgItem(hwnd,ID_ETA_STATIC),L"");
             DWORD ec=(DWORD)(ULONG_PTR)lp;
@@ -4408,18 +4643,19 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp)
 
     case WM_CONFIRM_OW:{
             wchar_t *path=(wchar_t*)lp;
-            wchar_t msg[MAX_PATH+80];
             wchar_t *fn=wcsrchr(path,L'\\');
-            _snwprintf(msg,MAX_PATH+80,
-                L"Output file already exists:\n\n%s\n\nOverwrite?",fn?fn+1:path);
-            int r=MessageBoxW(hwnd,msg,L"SDR Trim - Overwrite?",
-                MB_YESNO|MB_ICONWARNING|MB_DEFBUTTON2);
+            /* Custom dialog: Yes / No / Rename */
+            wchar_t msg[MAX_PATH+120];
+            _snwprintf(msg,MAX_PATH+120,
+                L"Output file already exists:\n\n%s\n\n"
+                L"Overwrite?  (or choose Rename to create a new file)",
+                fn?fn+1:path);
+            int ret=show_ow_dialog(hwnd,path);
             free(path);
-            return r;
+            return ret;
         }
     case WM_BATCHDONE:
         g_running=FALSE; g_pause=FALSE; g_batch_run=FALSE; g_hprocess=NULL;
-        EnableWindow(GetDlgItem(hwnd,ID_RUN),TRUE);
         EnableWindow(GetDlgItem(hwnd,ID_CANCEL),FALSE);
         InvalidateRect(GetDlgItem(hwnd,ID_CANCEL),NULL,FALSE);
         update_run_batch_button();
@@ -4457,6 +4693,12 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp)
         return 0;
 
     case WM_DESTROY:
+        { RECT wr; GetWindowRect(hwnd,&wr);
+          wchar_t ip[MAX_PATH]; ini_path(ip,MAX_PATH);
+          ini_wi(L"W",L"cx",wr.right-wr.left);
+          ini_wi(L"W",L"cy",wr.bottom-wr.top);
+          ini_wi(L"W",L"x", wr.left);
+          ini_wi(L"W",L"y", wr.top); }
         if(g_font)       DeleteObject(g_font);
         if(g_font_bold)  DeleteObject(g_font_bold);
         if(g_font_mono)  DeleteObject(g_font_mono);
@@ -4494,7 +4736,7 @@ int WINAPI wWinMain(HINSTANCE hi,HINSTANCE hp,LPWSTR lp,int ns)
     wc.lpszClassName=L"SDRTrimGUI";
     RegisterClassExW(&wc);
 
-    int cw=820, ch=920;
+    int cw=820, ch=800;
     RECT rc={0,0,cw,ch};
     AdjustWindowRect(&rc,WS_OVERLAPPED|WS_CAPTION|WS_SYSMENU|WS_MINIMIZEBOX|WS_THICKFRAME,FALSE);
     int ww=rc.right-rc.left, wh=rc.bottom-rc.top;
@@ -4505,13 +4747,23 @@ int WINAPI wWinMain(HINSTANCE hi,HINSTANCE hp,LPWSTR lp,int ns)
     wchar_t ini_p[MAX_PATH]; ini_path(ini_p,MAX_PATH);
     int saved_cx=(int)GetPrivateProfileIntW(L"W",L"cx",0,ini_p);
     int saved_cy=(int)GetPrivateProfileIntW(L"W",L"cy",0,ini_p);
-    if(saved_cx>=660&&saved_cy>=700){ ww=saved_cx; wh=saved_cy;
-        sx=(GetSystemMetrics(SM_CXSCREEN)-ww)/2;
-        sy=(GetSystemMetrics(SM_CYSCREEN)-wh)/2; }
+    int saved_x =(int)GetPrivateProfileIntW(L"W",L"x", -999999,ini_p);
+    int saved_y =(int)GetPrivateProfileIntW(L"W",L"y", -999999,ini_p);
+    if(saved_cx>=660&&saved_cy>=700){ ww=saved_cx; wh=saved_cy; }
+    if(saved_x!=-999999&&saved_y!=-999999){ sx=saved_x; sy=saved_y; }
     HWND hwnd=CreateWindowExW(WS_EX_ACCEPTFILES,L"SDRTrimGUI",L"SDR Trim",
         WS_OVERLAPPED|WS_CAPTION|WS_SYSMENU|WS_MINIMIZEBOX|WS_THICKFRAME|WS_MAXIMIZEBOX,
         sx,sy,ww,wh,NULL,NULL,hi,NULL);
 
+    /* Ensure window fits on screen vertically */
+    { RECT wr; GetWindowRect(hwnd,&wr);
+      int sh=GetSystemMetrics(SM_CYSCREEN)-GetSystemMetrics(SM_CYCAPTION)-4;
+      if(wr.bottom>sh){
+          int ny=sh-(wr.bottom-wr.top);
+          if(ny<0) ny=0;
+          SetWindowPos(hwnd,NULL,wr.left,ny,0,0,SWP_NOSIZE|SWP_NOZORDER);
+      }
+    }
     ShowWindow(hwnd,ns); UpdateWindow(hwnd);
     MSG m;
     while(GetMessageW(&m,NULL,0,0)){ TranslateMessage(&m); DispatchMessageW(&m); }
