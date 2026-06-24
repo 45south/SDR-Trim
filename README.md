@@ -6,7 +6,7 @@ IQ recording utility for SDRplay RSPdx, RSPduo, Perseus, and Jaguar receivers.
 
 ### ⚠️ A Quick Word of Warning: This is an AI-Assisted Project ⚠️
 
-**This project is a personal project for myself.**
+**This project is a personal project for my dx hobby.**
 
 Let's be upfront: a large language model (AI) helped write a significant portion of this code, *if not most.* I guided it, reviewed its output the best I could, and tested the result, but this project didn't evolve through the typical trial-and-error of a human-only endeavor. Even this README you're reading was drafted by the AI based on the source code, then edited and refined by me.
 
