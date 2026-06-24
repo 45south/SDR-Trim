@@ -703,7 +703,14 @@ static int detect_input(const char *path, RecInfo *r, FILE *fp,
                             r->epoch          = (int64_t)rcvr.unix_timestamp;
                             unix_to_utc(r->epoch,&r->year,&r->month,&r->day,
                                                   &r->hour,&r->minute,&r->second);
-                            r->fmt = (rcvr.flags==5) ? FMT_JAGUAR : FMT_PERSEUS;
+                            /* flags=5 -> Jaguar 1.6MHz; flags=4 -> check padding byte 16:
+                             * Perseus has padding[4]=0x01, Jaguar 2MHz has padding[4]=0x00 */
+                            if(rcvr.flags==5)
+                                r->fmt = FMT_JAGUAR;
+                            else if(rcvr.flags==4 && rcvr.padding[4]==0x00)
+                                r->fmt = FMT_JAGUAR;
+                            else
+                                r->fmt = FMT_PERSEUS;
                         }
                         if(csz>sizeof(RcvrChunk))
                             file_seek(fp,(int64_t)(csz-sizeof(RcvrChunk)),SEEK_CUR);
@@ -1015,8 +1022,7 @@ static int64_t write_wav_header(FILE *fp,
     if(out_fmt==FMT_PERSEUS||out_fmt==FMT_JAGUAR){
         /* Build rcvr chunk. flags field encodes the sample rate index:
          *   0=125k, 1=250k, 2=500k, 3=1000k, 4=2000k (16-bit), 5=Jaguar
-         * Constant fields matching genuine Jaguar/Perseus files:
-         * rcvr bytes 14,15,17 = 0x01 (verified from genuine Jaguar header). */
+         * Constant padding bytes differ between Perseus and Jaguar — set below. */
         RcvrChunk rc; memset(&rc,0,sizeof(rc));
         rc.centre_freq_hz  = (uint32_t)cf_hz;
         if(out_fmt==FMT_JAGUAR){
@@ -1031,9 +1037,23 @@ static int64_t write_wav_header(FILE *fp,
                        (sample_rate<=1000000)?3:4;
         }
         rc.unix_timestamp  = (uint32_t)utc_to_unix(sy,sm,sd,sh,smin,ssec);
-        /* Set constant fields present in all native Perseus files */
-        rc.padding[2] = 0x01; rc.padding[3] = 0x01;   /* rcvr+14,15 */
-        rc.padding[5] = 0x01;                          /* rcvr+17 */
+        /* Constant padding bytes verified from genuine hardware recordings:
+         * Perseus (all rates): padding[2,4,5] = 0x01  (rcvr bytes 14,16,17)
+         * Jaguar 1.6 MHz:      padding[2,3,5] = 0x01  (rcvr bytes 14,15,17)
+         * Jaguar 2.0 MHz:      padding[2,5]   = 0x01  (rcvr bytes 14,17) */
+        if(out_fmt==FMT_JAGUAR && sample_rate==1600000){
+            rc.padding[2] = 0x01;                          /* rcvr+14 */
+            rc.padding[3] = 0x01;                          /* rcvr+15 */
+            rc.padding[5] = 0x01;                          /* rcvr+17 */
+        } else if(out_fmt==FMT_JAGUAR && sample_rate==2000000){
+            rc.padding[2] = 0x01;                          /* rcvr+14 */
+            rc.padding[5] = 0x01;                          /* rcvr+17 */
+        } else {
+            /* Perseus — all rates */
+            rc.padding[2] = 0x01;                          /* rcvr+14 */
+            rc.padding[4] = 0x01;                          /* rcvr+16 */
+            rc.padding[5] = 0x01;                          /* rcvr+17 */
+        }
         fwrite("rcvr",1,4,fp);
         uint32_t rcvr_sz=sizeof(RcvrChunk);
         fwrite(&rcvr_sz,4,1,fp);
@@ -2606,7 +2626,13 @@ static BOOL probe_file(const wchar_t *path,FileInfo *fi)
                     fi->centre_hz=(int)rd32(hdr+ad+0);
                     uint32_t flags=rd32(hdr+ad+4);
                     uint32_t ts  =rd32(hdr+ad+8);
-                    fi->fmt=(flags==5)?5:4;  /* 4=Perseus, 5=Jaguar */
+                    /* flags=5 -> Jaguar 1.6MHz; flags=4 -> check padding byte 16 */
+                    if(flags==5)
+                        fi->fmt=5;
+                    else if(flags==4 && hdr[ad+16]==0x00)
+                        fi->fmt=5;  /* Jaguar 2MHz */
+                    else
+                        fi->fmt=4;  /* Perseus */
                     int64_t ep=(int64_t)ts;
                     unix_to_utc(ep,&fi->year,&fi->mon,&fi->day,
                                    &fi->hour,&fi->min,&fi->sec);
@@ -3978,7 +4004,7 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp)
             SetTextColor(di->hDC,CLR_HEADER_TEXT);
             if(g_font_title) SelectObject(di->hDC,g_font_title);
             RECT tr=di->rcItem; tr.left+=14;
-            DrawTextW(di->hDC,L"SDR Trim  v1.5.2",-1,&tr,DT_LEFT|DT_VCENTER|DT_SINGLELINE);
+            DrawTextW(di->hDC,L"SDR Trim  v1.5.5",-1,&tr,DT_LEFT|DT_VCENTER|DT_SINGLELINE);
             /* Name on right — use normal font, slightly smaller */
             if(g_font) SelectObject(di->hDC,g_font);
             RECT nr=di->rcItem; nr.right-=14;

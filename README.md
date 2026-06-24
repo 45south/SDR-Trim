@@ -1,4 +1,4 @@
-# SDR Trim  v1.5.4  (under test)
+# SDR Trim  v1.5.5
 
 IQ recording utility for SDRplay RSPdx, RSPduo, Perseus, and Jaguar receivers.
 
