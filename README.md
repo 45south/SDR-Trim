@@ -17,6 +17,7 @@ Second, it's worth knowing that this was a learning project for myself. The focu
 *   **Bugs are expected.** The logic very likely has quirks that haven't been discovered yet. Other issues causing crashes likely exist too. 
 *   **Use with caution!** Check edited and converted files before deleting your original recordings, if they are important to you.
 
+---
 
 **Trim · Convert · Extract · DDC**
 
