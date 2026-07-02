@@ -4127,6 +4127,7 @@ static void browse_file(void)
 /* ------------------------------------------------------------------ */
 /* Overwrite dialog state */
 static int      g_ow_result;
+static BOOL     g_yes_to_all = FALSE; /* set by "Yes to All" in overwrite dialog */
 static wchar_t  g_ow_msg[MAX_PATH+80];
 
 static INT_PTR CALLBACK ow_dlg_proc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp)
@@ -4138,9 +4139,10 @@ static INT_PTR CALLBACK ow_dlg_proc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp)
         return TRUE;
     case WM_COMMAND:
         switch(LOWORD(wp)){
-        case 101: g_ow_result=IDYES;   EndDialog(hwnd,0); break; /* Overwrite */
-        case 102: g_ow_result=IDRETRY; EndDialog(hwnd,0); break; /* Rename    */
-        case 103: g_ow_result=IDNO;    EndDialog(hwnd,0); break; /* Skip      */
+        case 101: g_ow_result=IDYES;    EndDialog(hwnd,0); break; /* Overwrite    */
+        case 104: g_ow_result=IDIGNORE; EndDialog(hwnd,0); break; /* Yes to All  */
+        case 102: g_ow_result=IDRETRY;  EndDialog(hwnd,0); break; /* Rename      */
+        case 103: g_ow_result=IDNO;     EndDialog(hwnd,0); break; /* Skip        */
         case IDCANCEL: g_ow_result=IDNO; EndDialog(hwnd,0); break;
         }
         return TRUE;
@@ -4169,6 +4171,8 @@ static WORD *ow_item(WORD *p,BYTE *base,
 
 static int show_ow_dialog(HWND parent, const wchar_t *path)
 {
+    if(g_yes_to_all) return IDYES;
+
     wchar_t *fn=wcsrchr(path,L'\\');
     _snwprintf(g_ow_msg,MAX_PATH+80,
         L"Output file already exists:\n\n%s\n\nChoose an action:",
@@ -4179,7 +4183,7 @@ static int show_ow_dialog(HWND parent, const wchar_t *path)
     DLGTEMPLATE *dt=(DLGTEMPLATE*)buf;
     dt->style=DS_MODALFRAME|DS_CENTER|DS_SETFONT|WS_POPUP|WS_CAPTION|WS_SYSMENU;
     dt->dwExtendedStyle=0;
-    dt->cdit=4;dt->x=0;dt->y=0;dt->cx=220;dt->cy=80;
+    dt->cdit=5;dt->x=0;dt->y=0;dt->cx=290;dt->cy=80;
     WORD *p=(WORD*)(dt+1);
     *p++=0;*p++=0;
     p=ow_wstr(p,L"SDR Trim — File Exists");
@@ -4187,13 +4191,15 @@ static int show_ow_dialog(HWND parent, const wchar_t *path)
     p=ow_wstr(p,L"Segoe UI");
 
     BYTE *base=(BYTE*)buf;
-    p=ow_item(p,base,  7, 7,206,28,100,0x0082,SS_LEFT|SS_NOPREFIX,       g_ow_msg);
-    p=ow_item(p,base,  7,54, 60,14,101,0x0080,BS_PUSHBUTTON|WS_TABSTOP,  L"Overwrite");
-    p=ow_item(p,base, 75,54, 60,14,102,0x0080,BS_DEFPUSHBUTTON|WS_TABSTOP,L"Rename");
-    p=ow_item(p,base,143,54, 60,14,103,0x0080,BS_PUSHBUTTON|WS_TABSTOP,  L"Skip");
+    p=ow_item(p,base,  7, 7,276,28,100,0x0082,SS_LEFT|SS_NOPREFIX,        g_ow_msg);
+    p=ow_item(p,base,  7,54, 60,14,101,0x0080,BS_PUSHBUTTON|WS_TABSTOP,   L"Overwrite");
+    p=ow_item(p,base, 75,54, 72,14,104,0x0080,BS_PUSHBUTTON|WS_TABSTOP,   L"Yes to All");
+    p=ow_item(p,base,155,54, 60,14,102,0x0080,BS_DEFPUSHBUTTON|WS_TABSTOP,L"Rename");
+    p=ow_item(p,base,223,54, 60,14,103,0x0080,BS_PUSHBUTTON|WS_TABSTOP,   L"Skip");
 
     g_ow_result=IDNO;
     DialogBoxIndirectW(g_hinst,dt,parent,ow_dlg_proc);
+    if(g_ow_result==IDIGNORE){ g_yes_to_all=TRUE; return IDYES; }
     return g_ow_result;
 }
 
@@ -4505,7 +4511,7 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp)
             SetTextColor(di->hDC,CLR_HEADER_TEXT);
             if(g_font_title) SelectObject(di->hDC,g_font_title);
             RECT tr=di->rcItem; tr.left+=14;
-            DrawTextW(di->hDC,L"SDR Trim  v1.6.1",-1,&tr,DT_LEFT|DT_VCENTER|DT_SINGLELINE);
+            DrawTextW(di->hDC,L"SDR Trim  v1.6.2",-1,&tr,DT_LEFT|DT_VCENTER|DT_SINGLELINE);
             /* Name on right — use normal font, slightly smaller */
             if(g_font) SelectObject(di->hDC,g_font);
             RECT nr=di->rcItem; nr.right-=14;
@@ -4693,6 +4699,7 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp)
                 break;
             }
             {
+                g_yes_to_all=FALSE;
                 ThreadArgs *args=(ThreadArgs*)malloc(sizeof(ThreadArgs));
                 if(!args) break;
                 if(!build_cmdline(args->cmdline,4096)){ free(args); break; }
@@ -4778,6 +4785,7 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp)
 
         case ID_RUN_BATCH:
             if(g_running||g_job_count==0) break;
+            g_yes_to_all=FALSE;
             {
                 /* Check for output files that already exist */
                 wchar_t conflict_list[4096]={0};
