@@ -84,6 +84,12 @@
 #define ID_SHOW_QUEUE       148
 #define ID_BATCH_STATUS     149
 #define ID_LOG_GROUP        135
+#define ID_INPUT_GROUP      152
+#define ID_OUTFOLDER_GROUP  153
+#define ID_MODE_GROUP       154
+#define ID_CHAN_GROUP       155
+#define ID_DDC_GROUP        156
+#define ID_OUTFMT_GROUP     157
 
 /* Custom messages */
 #define WM_APPENDLOG    (WM_USER + 1)  /* wp=0 lp=heap wchar_t*; wp=1 done, lp=exitcode */
@@ -2104,7 +2110,7 @@ static int sdr_process_args(int argc, char *argv[])
                     } while(n<100 && (ftest=fopen(outpath,"rb")) && !fclose(ftest));
                     proc_log("Renamed output: %s\n",outpath);
                 } else if(r!=IDYES){
-                    proc_log("Skipped — output file already exists.\n");
+                    proc_log("Skipped - output file already exists.\n");
                     fclose(fin); free(fir_h); return 1; /* 1 = skip, batch continues */
                 }
             }
@@ -2227,7 +2233,7 @@ static int sdr_process_args(int argc, char *argv[])
             /* Round down to whole seconds */
             uint64_t out_sr = need_resamp?(uint64_t)resamp_target:(uint64_t)rec.sample_rate;
             if(out_sr>0) split_max_frames = (split_max_frames/out_sr)*out_sr;
-            proc_log("Output exceeds 4 GB — will be split into parts of %llu frames.\n",
+            proc_log("Output exceeds 4 GB - will be split into parts of %llu frames.\n",
                      (unsigned long long)split_max_frames);
         }
     }
@@ -2462,6 +2468,7 @@ typedef struct {
 /* ------------------------------------------------------------------ */
 static HWND      g_hwnd;
 static HWND      g_hwnd_batch = NULL;  /* batch queue window */
+static HWND      g_hwnd_log   = NULL;  /* floating log window */
 static int       g_sample_rate = 0;  /* sample rate of currently loaded file */
 static int       g_fi_fmt      = -1; /* format of currently loaded file */
 static wchar_t   g_out_folder[MAX_PATH] = {0}; /* custom output folder, or empty for same as input */
@@ -2582,14 +2589,14 @@ static void restore_settings(void)
 /* ------------------------------------------------------------------ */
 static void log_append(const wchar_t *t)
 {
-    HWND h=GetDlgItem(g_hwnd,ID_LOG_EDIT);
+    HWND h=g_hwnd_log ? GetDlgItem(g_hwnd_log,ID_LOG_EDIT) : NULL;
     int n=GetWindowTextLengthW(h);
     SendMessageW(h,EM_SETSEL,n,n);
     SendMessageW(h,EM_REPLACESEL,FALSE,(LPARAM)t);
     int lines=(int)SendMessageW(h,EM_GETLINECOUNT,0,0);
     SendMessageW(h,EM_LINESCROLL,0,lines);
 }
-static void log_clear(void){ SetWindowTextW(GetDlgItem(g_hwnd,ID_LOG_EDIT),L""); }
+static void log_clear(void){ if(g_hwnd_log) SetWindowTextW(GetDlgItem(g_hwnd_log,ID_LOG_EDIT),L""); }
 
 /* ------------------------------------------------------------------ */
 /*  Output filename prediction — file probing                         */
@@ -3945,7 +3952,7 @@ static void create_controls(HWND hwnd)
     int M=12, y=g_header_h+14;
 
     /* ── Input ── */
-    mk_group(hwnd,L"Input File",M,y,W-M*2,152);
+    { HWND hg=mk_group(hwnd,L"Input File",M,y,W-M*2,152); SetWindowLongW(hg,GWLP_ID,ID_INPUT_GROUP); }
     mk_edit(hwnd,ID_INPUT_EDIT,M+10,y+22,W-M*2-230,24,FALSE,FALSE);
     mk_btn(hwnd,ID_BROWSE,   L"Browse...",W-M-218,y+22,72,24,BS_PUSHBUTTON);
     mk_btn(hwnd,ID_SEQ_ADD,  L"+ Add",   W-M-140,y+22,62,24,BS_PUSHBUTTON);
@@ -3969,7 +3976,7 @@ static void create_controls(HWND hwnd)
     y+=160;
 
     /* ── Output Folder ── */
-    mk_group(hwnd,L"Output Folder",M,y,W-M*2,50);
+    { HWND hg=mk_group(hwnd,L"Output Folder",M,y,W-M*2,50); SetWindowLongW(hg,GWLP_ID,ID_OUTFOLDER_GROUP); }
     { HWND he=mk_edit(hwnd,ID_OUTFOLDER_EDIT,M+10,y+18,W-M*2-196,22,FALSE,FALSE);
       SetWindowTextW(he,g_out_folder); }
     mk_btn(hwnd,ID_OUTFOLDER_BROWSE,L"Browse...",W-M-184,y+18,72,22,BS_PUSHBUTTON);
@@ -3977,7 +3984,7 @@ static void create_controls(HWND hwnd)
     y+=58;
 
     /* ── Mode ── */
-    mk_group(hwnd,L"Mode",M,y,W-M*2,54);
+    { HWND hg=mk_group(hwnd,L"Mode",M,y,W-M*2,54); SetWindowLongW(hg,GWLP_ID,ID_MODE_GROUP); }
     mk_radio(hwnd,ID_MODE_FULL,L"Full file",M+10, y+26,84,20,TRUE);
     mk_radio(hwnd,ID_MODE_TRIM,L"Trim",     M+102,y+26,58,20,FALSE);
     mk_static(hwnd,L"Start:",M+170,y+28,42,16);
@@ -3988,14 +3995,14 @@ static void create_controls(HWND hwnd)
     y+=63;
 
     /* ── Channel ── */
-    mk_group(hwnd,L"Channel",M,y,W-M*2,50);
+    { HWND hg=mk_group(hwnd,L"Channel",M,y,W-M*2,50); SetWindowLongW(hg,GWLP_ID,ID_CHAN_GROUP); }
     mk_radio(hwnd,ID_CHAN_DUAL,L"Dual (both tuners)",M+10, y+26,148,20,TRUE);
     mk_radio(hwnd,ID_CHAN_CH1, L"Tuner A  (--ch1)",  M+174,y+26,130,20,FALSE);
     mk_radio(hwnd,ID_CHAN_CH2, L"Tuner B  (--ch2)",  M+318,y+26,130,20,FALSE);
     y+=59;
 
     /* ── DDC ── */
-    mk_group(hwnd,L"DDC  (Digital Down-Conversion)",M,y,W-M*2,54);
+    { HWND hg=mk_group(hwnd,L"DDC  (Digital Down-Conversion)",M,y,W-M*2,54); SetWindowLongW(hg,GWLP_ID,ID_DDC_GROUP); }
     { HWND hu=CreateWindowExW(0,L"STATIC",L"",WS_CHILD|SS_LEFT,
         M+230,y,260,20,hwnd,(HMENU)(UINT_PTR)ID_DDC_UNAVAIL,g_hinst,NULL);
       SendMessageW(hu,WM_SETFONT,(WPARAM)g_font,FALSE); }
@@ -4013,7 +4020,7 @@ static void create_controls(HWND hwnd)
         (HINSTANCE)GetWindowLongPtrW(hwnd,GWLP_HINSTANCE),NULL);
       SetWindowPos(hbw,HWND_TOP,0,0,0,0,SWP_NOMOVE|SWP_NOSIZE); }
     y+=63;
-    mk_group(hwnd,L"Output Format",M,y,W-M*2,72);
+    { HWND hg=mk_group(hwnd,L"Output Format",M,y,W-M*2,72); SetWindowLongW(hg,GWLP_ID,ID_OUTFMT_GROUP); }
     mk_radio(hwnd,ID_FMT_SAME,      L"Same as input", M+8,  y+22,120,20,TRUE);
     mk_radio(hwnd,ID_FMT_LINRAD,    L"Linrad",         M+136,y+22, 62,20,FALSE);
     mk_radio(hwnd,ID_FMT_WAVVIEWDX, L"WavViewDX",      M+206,y+22, 96,20,FALSE);
@@ -4038,11 +4045,7 @@ static void create_controls(HWND hwnd)
     y+=26;
 
     /* ── Log ── */
-    int log_h=90;
-    { HWND hg=mk_group(hwnd,L"Output Log",M,y,W-M*2,log_h+22);
-      SetWindowLongW(hg,GWLP_ID,ID_LOG_GROUP); }
-    mk_edit(hwnd,ID_LOG_EDIT,M+8,y+20,W-M*2-16,log_h,TRUE,TRUE);
-    y+=log_h+30;
+    /* log removed - floating window */
 
     /* ── Progress bar row ── */
     int prog_h=18, lbl_h=18;
@@ -4063,7 +4066,7 @@ static void create_controls(HWND hwnd)
     mk_btn(hwnd,ID_SHOW_QUEUE,  L"Show Queue",   M+104,  y,90,28,BS_PUSHBUTTON);
     mk_btn(hwnd,ID_RUN,    L"Run",       W-M-256,y,78,28,BS_OWNERDRAW);
     mk_btn(hwnd,ID_CANCEL, L"Cancel",    W-M-170,y,78,28,BS_OWNERDRAW);
-    mk_btn(hwnd,ID_CLEAR,  L"Clear Log", W-M-84, y,78,28,BS_PUSHBUTTON);
+    mk_btn(hwnd,ID_CLEAR,  L"Show Log",  W-M-84, y,78,28,BS_PUSHBUTTON);
 
     /* ── Initial state ── */
     CheckRadioButton(hwnd,ID_MODE_FULL,ID_MODE_TRIM,ID_MODE_FULL);
@@ -4349,6 +4352,66 @@ static LRESULT CALLBACK batch_wnd_proc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp)
     return DefWindowProcW(hwnd,msg,wp,lp);
 }
 
+/* ------------------------------------------------------------------ */
+/*  Floating Log Window                                               */
+/* ------------------------------------------------------------------ */
+static LRESULT CALLBACK log_wnd_proc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp)
+{
+    switch(msg){
+    case WM_SIZE:{
+        int W2=LOWORD(lp),H2=HIWORD(lp);
+        int btn_h=26,btn_y=H2-btn_h-8;
+        SetWindowPos(GetDlgItem(hwnd,ID_LOG_EDIT),NULL,
+            8,8,W2-16,btn_y-16,SWP_NOZORDER);
+        SetWindowPos(GetDlgItem(hwnd,ID_CLEAR),NULL,
+            8,btn_y,90,btn_h,SWP_NOZORDER);
+        return 0;}
+    case WM_COMMAND:
+        if(LOWORD(wp)==ID_CLEAR) log_clear();
+        return 0;
+    case WM_CLOSE:
+        ShowWindow(hwnd,SW_HIDE);
+        return 0;
+    }
+    return DefWindowProcW(hwnd,msg,wp,lp);
+}
+
+static void show_log_window(void)
+{
+    if(!g_hwnd_log){
+        WNDCLASSEXW wc={0};
+        wc.cbSize=sizeof(wc); wc.lpfnWndProc=log_wnd_proc;
+        wc.hInstance=g_hinst; wc.hCursor=LoadCursor(NULL,IDC_ARROW);
+        wc.hbrBackground=(HBRUSH)(COLOR_BTNFACE+1);
+        wc.lpszClassName=L"SDRTrimLogWnd";
+        RegisterClassExW(&wc);
+
+        g_hwnd_log=CreateWindowExW(0,
+            L"SDRTrimLogWnd",L"SDR Trim — Output Log",
+            WS_POPUP|WS_CAPTION|WS_SYSMENU|WS_SIZEBOX|WS_VISIBLE,
+            0,0,660,400,g_hwnd,NULL,g_hinst,NULL);
+
+        /* Log edit */
+        HWND he=CreateWindowExW(WS_EX_CLIENTEDGE,L"EDIT",NULL,
+            WS_CHILD|WS_VISIBLE|WS_VSCROLL|ES_MULTILINE|ES_READONLY|ES_AUTOVSCROLL,
+            8,8,644,340,g_hwnd_log,(HMENU)(INT_PTR)ID_LOG_EDIT,g_hinst,NULL);
+        SendMessageW(he,WM_SETFONT,(WPARAM)g_font_mono,FALSE);
+
+        /* Clear button */
+        HWND hc=CreateWindowExW(0,L"BUTTON",L"Clear Log",
+            WS_CHILD|WS_VISIBLE|BS_PUSHBUTTON,
+            8,358,90,26,g_hwnd_log,(HMENU)(INT_PTR)ID_CLEAR,g_hinst,NULL);
+        SendMessageW(hc,WM_SETFONT,(WPARAM)g_font,FALSE);
+
+        /* Position to right of main window */
+        RECT mr; GetWindowRect(g_hwnd,&mr);
+        SetWindowPos(g_hwnd_log,HWND_TOP,mr.right+8,mr.top,660,400,SWP_NOSIZE);
+    } else {
+        ShowWindow(g_hwnd_log,SW_SHOW);
+        SetForegroundWindow(g_hwnd_log);
+    }
+}
+
 static void show_batch_window(void)
 {
     if(!g_hwnd_batch){
@@ -4396,12 +4459,6 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp)
         return 0;
 
 
-    case WM_GETMINMAXINFO:{
-        MINMAXINFO *mm=(MINMAXINFO*)lp;
-        mm->ptMinTrackSize.x=800;
-        mm->ptMinTrackSize.y=700;
-        return 0;}
-
     case WM_SIZE:{
         static BOOL done=FALSE;
         if(!done){
@@ -4409,60 +4466,7 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp)
             create_controls(hwnd);
             restore_settings();
             update_prediction();
-            return 0;
         }
-        /* Resize: reposition/resize stretchy controls */
-        if(wp==SIZE_MINIMIZED) return 0;
-        int W=LOWORD(lp), H=HIWORD(lp); (void)H;
-        int M=12;
-        HDWP hdwp=BeginDeferWindowPos(16);
-        #define MV(id,x,y,w,h) \
-            hdwp=DeferWindowPos(hdwp,GetDlgItem(hwnd,id),NULL,x,y,w,h, \
-                SWP_NOZORDER|SWP_NOACTIVATE);
-
-        /* Input edit stretches, Browse stays right */
-        MV(ID_INPUT_EDIT, M+10,       g_header_h+14+22,  W-M*2-230, 24)
-        MV(ID_BROWSE,     W-M-218,   g_header_h+14+22,  72,        24)
-        MV(ID_SEQ_ADD,    W-M-140,   g_header_h+14+22,  62,        24)
-        MV(ID_SEQ_AUTO,   W-M-74,    g_header_h+14+22,  62,        24)
-        MV(ID_REC_INFO,   M+10,      g_header_h+14+50,  W-M*2-200, 20)
-        MV(ID_SR_INFO,    W-M-246,   g_header_h+14+50,  240,       20)
-        MV(ID_SEQ_LIST,   M+10,      g_header_h+14+72,  W-M*2-86,  68)
-        MV(ID_SEQ_REMOVE, W-M-72,    g_header_h+14+72,  68,        22)
-
-        /* Output folder */
-        MV(ID_OUTFOLDER_EDIT,    M+10,    g_header_h+14+160, W-M*2-196, 22)
-        MV(ID_OUTFOLDER_BROWSE,  W-M-184, g_header_h+14+160, 72,        22)
-        MV(ID_OUTFOLDER_CLEAR,   W-M-108, g_header_h+14+160, 106,       22)
-
-        /* Prediction label stretches */
-        MV(ID_OUTFILE_STATIC, M+2,  538,  W-M*2-4, 18)
-
-        /* Log group + edit stretch */
-        int log_top = 534;
-        int log_group_h = 120;
-        MV(ID_LOG_EDIT,   M+8,      log_top+20, W-M*2-16, log_group_h)
-        MV(ID_LOG_GROUP,  M,        log_top,    W-M*2,    log_group_h+22)
-
-        /* Progress bar stretches */
-        int prog_y=log_top+log_group_h+30;
-        int bar_x=M+40, bar_w=W-M-94-bar_x;
-        MV(ID_PROGRESS,  bar_x, prog_y,       bar_w, 18)
-        MV(ID_ETA_STATIC,W-M-90,prog_y,       90,    18)
-
-        /* Buttons move right */
-        int btn_y=prog_y+26;
-        MV(ID_ADD_BATCH,  M,       btn_y, 96, 28)
-        MV(ID_SHOW_QUEUE, M+104,   btn_y, 90, 28)
-        MV(ID_RUN,    W-M-256, btn_y, 78, 28)
-        MV(ID_CANCEL, W-M-170, btn_y, 78, 28)
-        MV(ID_CLEAR,  W-M-84,  btn_y, 78, 28)
-
-        /* Header panel stretches */
-        MV(ID_HEADER_PANEL, 0, 0, W, g_header_h)
-
-        #undef MV
-        EndDeferWindowPos(hdwp);
         return 0;}
 
     case WM_ERASEBKGND:{
@@ -4511,7 +4515,7 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp)
             SetTextColor(di->hDC,CLR_HEADER_TEXT);
             if(g_font_title) SelectObject(di->hDC,g_font_title);
             RECT tr=di->rcItem; tr.left+=14;
-            DrawTextW(di->hDC,L"SDR Trim  v1.6.2",-1,&tr,DT_LEFT|DT_VCENTER|DT_SINGLELINE);
+            DrawTextW(di->hDC,L"SDR Trim  v1.6.3",-1,&tr,DT_LEFT|DT_VCENTER|DT_SINGLELINE);
             /* Name on right — use normal font, slightly smaller */
             if(g_font) SelectObject(di->hDC,g_font);
             RECT nr=di->rcItem; nr.right-=14;
@@ -4700,6 +4704,7 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp)
             }
             {
                 g_yes_to_all=FALSE;
+                show_log_window();
                 ThreadArgs *args=(ThreadArgs*)malloc(sizeof(ThreadArgs));
                 if(!args) break;
                 if(!build_cmdline(args->cmdline,4096)){ free(args); break; }
@@ -4745,7 +4750,7 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp)
             }
             break;
 
-        case ID_CLEAR: log_clear(); break;
+        case ID_CLEAR: show_log_window(); break;
 
         case ID_SHOW_QUEUE:
             show_batch_window();
@@ -4786,6 +4791,7 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp)
         case ID_RUN_BATCH:
             if(g_running||g_job_count==0) break;
             g_yes_to_all=FALSE;
+            show_log_window();
             {
                 /* Check for output files that already exist */
                 wchar_t conflict_list[4096]={0};
@@ -5005,9 +5011,9 @@ int WINAPI wWinMain(HINSTANCE hi,HINSTANCE hp,LPWSTR lp,int ns)
     wc.lpszClassName=L"SDRTrimGUI";
     RegisterClassExW(&wc);
 
-    int cw=820, ch=830;
+    int cw=820, ch=676;
     RECT rc={0,0,cw,ch};
-    AdjustWindowRect(&rc,WS_OVERLAPPED|WS_CAPTION|WS_SYSMENU|WS_MINIMIZEBOX|WS_THICKFRAME,FALSE);
+    AdjustWindowRect(&rc,WS_OVERLAPPED|WS_CAPTION|WS_SYSMENU|WS_MINIMIZEBOX,FALSE);
     int ww=rc.right-rc.left, wh=rc.bottom-rc.top;
     int sx=(GetSystemMetrics(SM_CXSCREEN)-ww)/2;
     int sy=(GetSystemMetrics(SM_CYSCREEN)-wh)/2;
@@ -5019,9 +5025,11 @@ int WINAPI wWinMain(HINSTANCE hi,HINSTANCE hp,LPWSTR lp,int ns)
     int saved_x =(int)GetPrivateProfileIntW(L"W",L"x", -999999,ini_p);
     int saved_y =(int)GetPrivateProfileIntW(L"W",L"y", -999999,ini_p);
     if(saved_cx>=660&&saved_cy>=700){ ww=saved_cx; wh=saved_cy; }
+    /* Cap height to screen height */
+    { int sh=GetSystemMetrics(SM_CYSCREEN); if(wh>sh-40) wh=sh-40; }
     if(saved_x!=-999999&&saved_y!=-999999){ sx=saved_x; sy=saved_y; }
     HWND hwnd=CreateWindowExW(WS_EX_ACCEPTFILES,L"SDRTrimGUI",L"SDR Trim",
-        WS_OVERLAPPED|WS_CAPTION|WS_SYSMENU|WS_MINIMIZEBOX|WS_THICKFRAME|WS_MAXIMIZEBOX,
+        WS_OVERLAPPED|WS_CAPTION|WS_SYSMENU|WS_MINIMIZEBOX,
         sx,sy,ww,wh,NULL,NULL,hi,NULL);
 
     /* Ensure window fits on screen vertically */
