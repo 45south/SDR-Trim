@@ -2101,10 +2101,10 @@ static int sdr_process_args(int argc, char *argv[])
                 /* wpath is freed by the handler */
                 if(r==IDRETRY){
                     /* Auto-rename: insert (1),(2)... before extension */
-                    char base[512], ext[32]=""; int n=1;
+                    char base[480], ext[32]=""; int n=1;
                     char *dot=strrchr(outpath,'.');
-                    if(dot){ strncpy(ext,dot,31); *dot='\0'; }
-                    strncpy(base,outpath,511);
+                    if(dot){ strncpy(ext,dot,31); ext[31]='\0'; *dot='\0'; }
+                    strncpy(base,outpath,479); base[479]='\0';
                     do {
                         snprintf(outpath,512,"%s (%d)%s",base,n++,ext);
                     } while(n<100 && (ftest=fopen(outpath,"rb")) && !fclose(ftest));
