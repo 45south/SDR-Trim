@@ -9,8 +9,8 @@ CREATEPROCESS_MANIFEST_RESOURCE_ID RT_MANIFEST "sdrtrim.manifest"
 
 /* Version information */
 VS_VERSION_INFO VERSIONINFO
- FILEVERSION      1,7,0,0
- PRODUCTVERSION   1,7,0,0
+ FILEVERSION      1,7,1,0
+ PRODUCTVERSION   1,7,1,0
  FILEFLAGSMASK    VS_FFI_FILEFLAGSMASK
  FILEFLAGS        0x0L
  FILEOS           VOS_NT_WINDOWS32
@@ -23,12 +23,12 @@ BEGIN
         BEGIN
             VALUE "CompanyName",      "45south"
             VALUE "FileDescription",  "SDR Trim - IQ Recording Converter"
-            VALUE "FileVersion",      "1.7.0.0"
+            VALUE "FileVersion",      "1.7.1.0"
             VALUE "InternalName",     "sdrtrim"
             VALUE "LegalCopyright",   "Copyright (C) 2026 45south"
             VALUE "OriginalFilename", "sdrtrim.exe"
             VALUE "ProductName",      "SDR Trim"
-            VALUE "ProductVersion",   "1.7.0.0"
+            VALUE "ProductVersion",   "1.7.1.0"
         END
     END
     BLOCK "VarFileInfo"

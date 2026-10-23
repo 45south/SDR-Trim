@@ -48,6 +48,7 @@
 #define ID_FMT_SDRCONNECT   114
 #define ID_FMT_PERSEUS      140
 #define ID_FMT_JAGUAR       141
+#define ID_FMT_SDRSHARP     158
 #define ID_OUT_16BIT        142
 #define ID_OUT_24BIT        143
 #define ID_BIT_LABEL        144
@@ -98,6 +99,7 @@
 #define WM_BATCHSTATUS  (WM_USER + 4)  /* wp=job_index, lp=heap wchar_t* status */
 #define WM_BATCHDONE    (WM_USER + 5)  /* batch run finished */
 #define WM_CONFIRM_OW   (WM_USER + 6)  /* wp=0 lp=heap wchar_t* path; returns IDYES/IDNO */
+#define WM_SETOUTLABEL  (WM_USER + 7)  /* lp=heap wchar_t* output path */
 
 /* ================================================================== */
 /*  Processing engine shim — bridges sdrtrim core to GUI              */
@@ -150,6 +152,7 @@ static void proc_perror(const char *msg)
  *   Linrad raw     (.raw)  41-byte header, single or dual tuner
  *   WavViewDX raw  (.raw)  headerless, metadata in filename
  *   SDRuno WAV     (.wav)  RIFF + auxi chunk, single tuner
+ *   SDRSharp WAV   (.wav)  RF64 WAVE, stereo int16, metadata from filename
  *   SDR Connect    (.wav)  RIFF + JUNK chunk, single tuner
  *
  * ── Supported output formats ─────────────────────────────────────────
@@ -219,7 +222,8 @@ typedef enum {
     FMT_SDRCONNECT= 3,
     FMT_PERSEUS   = 4,
     FMT_JAGUAR    = 5,
-    FMT_UNKNOWN   = 6
+    FMT_SDRSHARP  = 6,
+    FMT_UNKNOWN   = 7
 } FileFormat;
 
 /* rcvr chunk as used by Perseus (flags=4) and Jaguar (flags=5).
@@ -462,6 +466,38 @@ static void strip_extension(char *stem, const char *path)
    Returns 1 on success, 0 on failure. */
 /* Parse SDRuno filename: SDRuno_yyyymmdd_hhmmss_xxxxkHz_chN.wav
    Returns 1 on success, 0 if pattern not matched. */
+/* Parse SDRSharp filename: HH-MM-SS_<freq>Hz.wav  (e.g. 08-01-53_972000Hz.wav)
+   Date taken from file modification timestamp (no date in filename).
+   Returns 1 on success, 0 if pattern not matched. */
+static int parse_sdrsharp_filename(const char *path, RecInfo *r)
+{
+    char stem[512];
+    strip_extension(stem, path);
+    const char *bn = strrchr(stem, '\\');
+    if(!bn) bn = strrchr(stem, '/');
+    if(bn) bn++; else bn = stem;
+    int hh=0,mi=0,ss=0,cf_hz=0;
+    /* Pattern: HH-MM-SS_<freq>Hz */
+    if(sscanf(bn,"%2d-%2d-%2d_%dHz",&hh,&mi,&ss,&cf_hz)==4
+       && hh>=0 && hh<=23 && mi>=0 && mi<=59 && ss>=0 && ss<=59 && cf_hz>0){
+        r->hour=hh; r->minute=mi; r->second=ss;
+        r->centre_freq_hz=cf_hz;
+        /* Get date from file modification time */
+        struct __stat64 st;
+        int yy=0,mo=0,dd=0,th=0,tm2=0,ts=0;
+        {
+            wchar_t wpath[MAX_PATH];
+            MultiByteToWideChar(CP_UTF8,0,path,-1,wpath,MAX_PATH);
+            if(_wstat64(wpath,&st)==0)
+                unix_to_utc((int64_t)st.st_mtime,&yy,&mo,&dd,&th,&tm2,&ts);
+        }
+        r->year=yy; r->month=mo; r->day=dd;
+        r->epoch=utc_to_unix(yy,mo,dd,hh,mi,ss);
+        r->fmt=FMT_SDRSHARP;
+        return 1;
+    }
+    return 0;
+}
 static int parse_sdruno_filename(const char *path, RecInfo *r)
 {
     char stem[512];
@@ -742,6 +778,18 @@ static int detect_input(const char *path, RecInfo *r, FILE *fp,
                     file_seek(fp,(int64_t)csz+(csz&1),SEEK_CUR);
                 }
             }
+            /* Check if this is an SDRSharp file (no auxi chunk — metadata from filename) */
+            {
+                RecInfo tmp; memset(&tmp,0,sizeof(tmp));
+                if(parse_sdrsharp_filename(path,&tmp)){
+                    r->fmt=FMT_SDRSHARP;
+                    r->year=tmp.year; r->month=tmp.month; r->day=tmp.day;
+                    r->hour=tmp.hour; r->minute=tmp.minute; r->second=tmp.second;
+                    r->centre_freq_hz=tmp.centre_freq_hz;
+                    r->epoch=tmp.epoch;
+                    return 1;
+                }
+            }
             /* Fallback: if auxi gave no date, try filename */
             if(r->year==0){
                 RecInfo tmp; memset(&tmp,0,sizeof(tmp));
@@ -804,9 +852,21 @@ static int detect_input(const char *path, RecInfo *r, FILE *fp,
             }
         }
         /* Fallback: if auxi gave no date, try filename.
-           Also handles RF64 SDR Connect (JUNK chunk present, no auxi). */
+           Also handles RF64 SDR Connect and SDRSharp (no auxi chunk). */
         if(r->year==0){
-            /* Try SDRuno filename first */
+            /* Try SDRSharp filename first (RF64, no auxi, HH-MM-SS_<freq>Hz) */
+            {
+                RecInfo tmp; memset(&tmp,0,sizeof(tmp));
+                if(parse_sdrsharp_filename(path,&tmp)){
+                    r->fmt=FMT_SDRSHARP;
+                    r->year=tmp.year; r->month=tmp.month; r->day=tmp.day;
+                    r->hour=tmp.hour; r->minute=tmp.minute; r->second=tmp.second;
+                    r->centre_freq_hz=tmp.centre_freq_hz;
+                    r->epoch=tmp.epoch;
+                    return 1;
+                }
+            }
+            /* Try SDRuno filename */
             RecInfo tmp; memset(&tmp,0,sizeof(tmp));
             if(parse_sdruno_filename(path,&tmp)){
                 r->year=tmp.year; r->month=tmp.month; r->day=tmp.day;
@@ -845,7 +905,7 @@ static int detect_input(const char *path, RecInfo *r, FILE *fp,
 
     proc_log(
         "Error: cannot detect input format for '%s'.\n"
-        "  Supported formats: Linrad raw, WavViewDX raw, SDRuno WAV, SDR Connect WAV\n",
+        "  Supported formats: Linrad raw, WavViewDX raw, SDRuno WAV, SDR Connect WAV, SDRSharp WAV\n",
         path);
     return 0;
 }
@@ -885,6 +945,12 @@ static void build_sdruno_filename(char *out, size_t sz,
     int kHz=freq_hz/1000;
     snprintf(out,sz,"SDRuno_%04d%02d%02d_%02d%02d%02dZ_%dkHz.wav",
              year,month,day,hh,mm,ss,kHz);
+}
+
+static void build_sdrsharp_filename(char *out, size_t sz,
+    int hh,int mm,int ss,int freq_hz)
+{
+    snprintf(out,sz,"%02d-%02d-%02d_%dHz.wav",hh,mm,ss,freq_hz);
 }
 
 static void build_sdrconnect_filename(char *out, size_t sz,
@@ -1827,6 +1893,7 @@ static int sdr_process_args(int argc, char *argv[])
         else if(strcmp(argv[i],"linrad"    )==0) out_fmt=FMT_LINRAD;
         else if(strcmp(argv[i],"wavviewdx" )==0) out_fmt=FMT_WAVVIEWDX;
         else if(strcmp(argv[i],"sdruno"    )==0) out_fmt=FMT_SDRUNO;
+        else if(strcmp(argv[i],"sdrsharp"  )==0) out_fmt=FMT_SDRSHARP;
         else if(strcmp(argv[i],"sdrconnect")==0) out_fmt=FMT_SDRCONNECT;
         else if(strcmp(argv[i],"perseus"   )==0) out_fmt=FMT_PERSEUS;
         else if(strcmp(argv[i],"jaguar"    )==0) out_fmt=FMT_JAGUAR;
@@ -1838,6 +1905,7 @@ static int sdr_process_args(int argc, char *argv[])
             if     (strcmp(argv[i],"linrad"    )==0) out_fmt=FMT_LINRAD;
             else if(strcmp(argv[i],"wavviewdx" )==0) out_fmt=FMT_WAVVIEWDX;
             else if(strcmp(argv[i],"sdruno"    )==0) out_fmt=FMT_SDRUNO;
+            else if(strcmp(argv[i],"sdrsharp"  )==0) out_fmt=FMT_SDRSHARP;
             else if(strcmp(argv[i],"sdrconnect")==0) out_fmt=FMT_SDRCONNECT;
             else if(strcmp(argv[i],"perseus"   )==0) out_fmt=FMT_PERSEUS;
             else if(strcmp(argv[i],"jaguar"    )==0) out_fmt=FMT_JAGUAR;
@@ -1904,6 +1972,10 @@ static int sdr_process_args(int argc, char *argv[])
             out_fmt = (rec.fmt==FMT_UNKNOWN) ? FMT_SDRUNO : rec.fmt;
         }
     }
+    /* SDRSharp output uses the same WAV binary format as SDRuno;
+       preserve original request for filename building */
+    int out_fmt_req = out_fmt;
+    if(out_fmt==FMT_SDRSHARP) out_fmt=FMT_SDRUNO;
 
     /* Validate: WAV formats not allowed for dual-tuner output */
     if(out_is_dual && (out_fmt==FMT_SDRUNO||out_fmt==FMT_SDRCONNECT||
@@ -1916,7 +1988,8 @@ static int sdr_process_args(int argc, char *argv[])
 
     /* ── Format name strings (used in messages below) ── */
     const char *fmt_names[]={"Linrad raw","WavViewDX raw","SDRuno WAV",
-                              "SDR Connect WAV","Perseus WAV","Jaguar WAV","Unknown"};
+                              "SDR Connect WAV","Perseus WAV","Jaguar WAV",
+                              "SDRSharp WAV","Unknown"};
 
     /* Validate: same input and output format with no meaningful operation.
      *
@@ -2100,10 +2173,15 @@ static int sdr_process_args(int argc, char *argv[])
               if(n+4<sizeof(outbase)) strcat(outbase,".raw"); }
             break;
         case FMT_SDRUNO:
-            build_sdruno_filename(outbase,sizeof(outbase),
-                out_year,out_month,out_day,
-                trim_sh,trim_sm,trim_ss,
-                ddc_cf_hz);
+            if(out_fmt_req==FMT_SDRSHARP){
+                build_sdrsharp_filename(outbase,sizeof(outbase),
+                    trim_sh,trim_sm,trim_ss,ddc_cf_hz);
+            } else {
+                build_sdruno_filename(outbase,sizeof(outbase),
+                    out_year,out_month,out_day,
+                    trim_sh,trim_sm,trim_ss,
+                    ddc_cf_hz);
+            }
             break;
         case FMT_SDRCONNECT:
             build_sdrconnect_filename(outbase,sizeof(outbase),
@@ -2181,6 +2259,19 @@ static int sdr_process_args(int argc, char *argv[])
     proc_log("Output file : %s\n\n",outpath);
 
     /* ── Build SeqReader from main input + any --seq files ── */
+    /* Rebuild g_seq_paths from --seq arguments in argv so batch jobs use
+       their own sequence list rather than whatever the GUI last loaded. */
+    g_seq_count = 0;
+    for(int i=opt_start; i<argc; i++){
+        if(strcmp(argv[i],"--seq")==0 && i+1<argc){
+            i++;
+            if(g_seq_count < SEQ_MAX-1){
+                MultiByteToWideChar(CP_UTF8,0,argv[i],-1,
+                    g_seq_paths[g_seq_count],MAX_PATH);
+                g_seq_count++;
+            }
+        }
+    }
     SeqReader sr; memset(&sr,0,sizeof(sr));
     /* First file is always inpath (already open as fin) */
     /* inpath is char* - convert to wchar_t */
@@ -2188,7 +2279,7 @@ static int sdr_process_args(int argc, char *argv[])
     sr.count=1; sr.in_ch=rec.num_channels; sr.sample_rate=rec.sample_rate;
     sr.data_offset=rec.data_offset; sr.cur=0; sr.fp=NULL;
     sr.bytes_per_samp = (rec.bits_per_sample>0) ? (rec.bits_per_sample/8) : 2;
-    /* Add sequence files from global g_seq_paths (set by GUI) */
+    /* Add sequence files from g_seq_paths (now populated from argv --seq) */
     for(int si=0;si<g_seq_count && sr.count<SEQ_MAX;si++){
         wcsncpy(sr.paths[sr.count],g_seq_paths[si],MAX_PATH-1);
         proc_log("Adding seq: '%ls'\n", sr.paths[sr.count]);
@@ -2283,11 +2374,11 @@ static int sdr_process_args(int argc, char *argv[])
                              / (double)rec.sample_rate + 0.5);
     uint64_t out_data_bytes=out_frames_actual*(uint64_t)out_ch*(uint64_t)(out_bps/8);
 
-    /* Perseus/Jaguar: flag if output will need splitting (>4GB) */
+    /* Perseus/Jaguar/SDRuno: flag if output will need splitting (>4GB) */
     int need_split = 0;
-    uint64_t split_max_data = 0xFFFFFFFFULL - 86; /* max data bytes per part */
+    uint64_t split_max_data = 0xFFFFFFFFULL - 216; /* max data bytes per part (RIFF limit minus largest header) */
     uint64_t split_max_frames = 0;
-    if(out_fmt==FMT_PERSEUS||out_fmt==FMT_JAGUAR){
+    if(out_fmt==FMT_PERSEUS||out_fmt==FMT_JAGUAR||out_fmt==FMT_SDRUNO){
         uint64_t expected_bytes = out_frames_actual*(uint64_t)out_ch*(uint64_t)(out_bps/8);
         if(expected_bytes > split_max_data){
             need_split = 1;
@@ -2412,20 +2503,43 @@ static int sdr_process_args(int argc, char *argv[])
                 : part_in_frames;
             uint64_t part_data_bytes = part_out_frames*(uint64_t)out_ch*(uint64_t)(out_bps/8);
 
-            /* Build part filename: insert _001 before extension */
-            char part_path[MAX_PATH*3];
-            { char *dot=strrchr(outpath,'.');
-              if(dot){
-                  size_t base_len=(size_t)(dot-outpath);
-                  snprintf(part_path,sizeof(part_path),"%.*s_%03d%s",
-                           (int)base_len,outpath,part,dot);
-              } else {
-                  snprintf(part_path,sizeof(part_path),"%s_%03d",outpath,part);
-              } }
-
             /* Compute part start time */
             int py,pmo,pd,ph,pmin,ps;
             unix_to_utc(part_epoch,&py,&pmo,&pd,&ph,&pmin,&ps);
+
+            /* Build part filename */
+            char part_path[MAX_PATH*3];
+            if(out_fmt==FMT_SDRUNO){
+                /* Use timestamp-based name matching native convention */
+                char part_base[256];
+                if(out_fmt_req==FMT_SDRSHARP){
+                    build_sdrsharp_filename(part_base,sizeof(part_base),
+                        ph,pmin,ps,ddc_cf_hz);
+                } else {
+                    build_sdruno_filename(part_base,sizeof(part_base),
+                        py,pmo,pd,ph,pmin,ps,ddc_cf_hz);
+                }
+                /* Extract directory from outpath */
+                char outdir2[MAX_PATH*2]; outdir2[0]='\0';
+                const char *last_sep=NULL;
+                for(const char *p=outpath;*p;p++)
+                    if(*p=='\\'||*p=='/') last_sep=p;
+                if(last_sep){
+                    size_t dlen=(size_t)(last_sep+1-outpath);
+                    if(dlen<sizeof(outdir2)){ memcpy(outdir2,outpath,dlen); outdir2[dlen]='\0'; }
+                }
+                snprintf(part_path,sizeof(part_path),"%s%s",outdir2,part_base);
+            } else {
+                /* Perseus/Jaguar: insert _001 before extension */
+                char *dot=strrchr(outpath,'.');
+                if(dot){
+                    size_t base_len=(size_t)(dot-outpath);
+                    snprintf(part_path,sizeof(part_path),"%.*s_%03d%s",
+                             (int)base_len,outpath,part,dot);
+                } else {
+                    snprintf(part_path,sizeof(part_path),"%s_%03d",outpath,part);
+                }
+            }
 
             /* Part end time */
             int64_t part_end_epoch = part_epoch+(int64_t)(part_out_frames/out_sr);
@@ -2467,8 +2581,10 @@ static int sdr_process_args(int argc, char *argv[])
         }
         if(rc<0) goto write_error;
         seq_close(&sr); fclose(fout); free(fir_h);
-        /* Remove the zero-byte placeholder file opened initially */
-        remove(outpath);
+        /* Remove the zero-byte placeholder file opened initially.
+           For SDRuno, part 1 shares the same name as outpath, so skip. */
+        if(out_fmt!=FMT_SDRUNO)
+            remove(outpath);
     }
     if(rc==2){
         proc_log("Cancelled. Partial output: %s\n",outpath);
@@ -2601,8 +2717,9 @@ static void save_settings(void)
         IsDlgButtonChecked(g_hwnd,ID_FMT_WAVVIEWDX) ?2:
         IsDlgButtonChecked(g_hwnd,ID_FMT_SDRUNO)    ?3:
         IsDlgButtonChecked(g_hwnd,ID_FMT_SDRCONNECT)?4:
-        IsDlgButtonChecked(g_hwnd,ID_FMT_PERSEUS)?5:
-        IsDlgButtonChecked(g_hwnd,ID_FMT_JAGUAR)?6:0);
+        IsDlgButtonChecked(g_hwnd,ID_FMT_PERSEUS)   ?5:
+        IsDlgButtonChecked(g_hwnd,ID_FMT_JAGUAR)    ?6:
+        IsDlgButtonChecked(g_hwnd,ID_FMT_SDRSHARP)  ?7:0);
     ini_wi(L"S",L"DDC", IsDlgButtonChecked(g_hwnd,ID_DDC_CHECK)?1:0);
     GetWindowTextW(GetDlgItem(g_hwnd,ID_DDC_CENTRE),b,16); ini_ws(L"S",L"DDCcf",b);
     ini_ws(L"S",L"OutFolder",g_out_folder);
@@ -2627,10 +2744,11 @@ static void restore_settings(void)
     CheckRadioButton(g_hwnd,ID_CHAN_DUAL,ID_CHAN_CH2,
         chan==1?ID_CHAN_CH1:chan==2?ID_CHAN_CH2:ID_CHAN_DUAL);
     int fmt=ini_ri(L"S",L"Fmt",0);
-    CheckRadioButton(g_hwnd,ID_FMT_SAME,ID_FMT_JAGUAR,
+    CheckRadioButton(g_hwnd,ID_FMT_SAME,ID_FMT_SDRSHARP,
         fmt==1?ID_FMT_LINRAD:fmt==2?ID_FMT_WAVVIEWDX:
         fmt==3?ID_FMT_SDRUNO:fmt==4?ID_FMT_SDRCONNECT:
-        fmt==5?ID_FMT_PERSEUS:fmt==6?ID_FMT_JAGUAR:ID_FMT_SAME);
+        fmt==5?ID_FMT_PERSEUS:fmt==6?ID_FMT_JAGUAR:
+        fmt==7?ID_FMT_SDRSHARP:ID_FMT_SAME);
     int ddc=ini_ri(L"S",L"DDC",0);
     CheckDlgButton(g_hwnd,ID_DDC_CHECK,ddc?BST_CHECKED:BST_UNCHECKED);
     EnableWindow(GetDlgItem(g_hwnd,ID_DDC_CENTRE),ddc);
@@ -2647,7 +2765,18 @@ static void restore_settings(void)
 static void log_append(const wchar_t *t)
 {
     HWND h=g_hwnd_log ? GetDlgItem(g_hwnd_log,ID_LOG_EDIT) : NULL;
+    if(!h) return;
+    /* Trim oldest quarter when within 64KB of the 2MB limit */
     int n=GetWindowTextLengthW(h);
+    if(n > 2*1024*1024 - 65536){
+        int trim = n/4;
+        /* Find next line boundary after trim point */
+        int line = (int)SendMessageW(h,EM_LINEFROMCHAR,trim,0);
+        trim = (int)SendMessageW(h,EM_LINEINDEX,line+1,0);
+        SendMessageW(h,EM_SETSEL,0,trim);
+        SendMessageW(h,EM_REPLACESEL,FALSE,(LPARAM)L"[... earlier log trimmed ...]\r\n");
+        n=GetWindowTextLengthW(h);
+    }
     SendMessageW(h,EM_SETSEL,n,n);
     SendMessageW(h,EM_REPLACESEL,FALSE,(LPARAM)t);
     int lines=(int)SendMessageW(h,EM_GETLINECOUNT,0,0);
@@ -2835,14 +2964,34 @@ static BOOL probe_file(const wchar_t *path,FileInfo *fi)
             fi->centre_hz=ff;
             return TRUE;
         }
-        /* SDRuno with no auxi found (data chunk reached first) */
+        /* SDRuno/SDRSharp with no auxi found (data chunk reached first) */
         if(have_fmt && !is_sdrconnect){
-            fi->fmt=2;
-            /* Try to get timestamp and frequency from filename as fallback */
             const wchar_t *bn=wcsrchr(path,L'\\'); if(!bn)bn=path; else bn++;
             wchar_t stem[MAX_PATH]; wcsncpy(stem,bn,MAX_PATH-1);
             wchar_t *dot=wcsrchr(stem,L'.'); if(dot)*dot=L'\0';
+            int cf_hz=0;
+            /* Try SDRSharp filename: HH-MM-SS_<freq>Hz */
+            {
+                int hh=0,mi=0,ss=0;
+                if(swscanf(stem,L"%2d-%2d-%2d_%dHz",&hh,&mi,&ss,&cf_hz)==4
+                   && hh>=0 && hh<=23 && mi>=0 && mi<=59
+                   && ss>=0 && ss<=59 && cf_hz>0){
+                    fi->fmt=6; /* FMT_SDRSHARP */
+                    fi->hour=hh; fi->min=mi; fi->sec=ss;
+                    fi->centre_hz=cf_hz;
+                    /* Date from file mtime */
+                    struct __stat64 st;
+                    if(_wstat64(path,&st)==0){
+                        int th=0,tm2=0,ts2=0;
+                        unix_to_utc((int64_t)st.st_mtime,&fi->year,&fi->mon,&fi->day,
+                                    &th,&tm2,&ts2);
+                    }
+                    return TRUE;
+                }
+            }
             int cf_khz=0;
+            /* Fall back to SDRuno */
+            fi->fmt=2;
             if(swscanf(stem,L"SDRuno_%4d%2d%2d_%2d%2d%2dZ_%dkHz",
                 &fi->year,&fi->mon,&fi->day,&fi->hour,&fi->min,&fi->sec,&cf_khz)<7)
                 swscanf(stem,L"SDRuno_%4d%2d%2d_%2d%2d%2d_%dkHz",
@@ -2883,6 +3032,7 @@ static BOOL predict_outfile(const wchar_t *inpath,wchar_t *outfile,int n)
     else if(IsDlgButtonChecked(g_hwnd,ID_FMT_SDRCONNECT)) out_fmt=3;
     else if(IsDlgButtonChecked(g_hwnd,ID_FMT_PERSEUS))    out_fmt=4;
     else if(IsDlgButtonChecked(g_hwnd,ID_FMT_JAGUAR))     out_fmt=5;
+    else if(IsDlgButtonChecked(g_hwnd,ID_FMT_SDRSHARP))   out_fmt=6;
     else out_fmt=fi.fmt;
     if(out_fmt<0) out_fmt=0;
     int dual_out=fi.dual;
@@ -2930,6 +3080,8 @@ static BOOL predict_outfile(const wchar_t *inpath,wchar_t *outfile,int n)
                 sy,smo,sd,sh,smi,ss,cf/1000); break;
     case 5: _snwprintf(name,MAX_PATH,L"Jaguar_%04d%02d%02d_%02d%02d%02dZ_%dkHz.wav",
                 sy,smo,sd,sh,smi,ss,cf/1000); break;
+    case 6: _snwprintf(name,MAX_PATH,L"%02d-%02d-%02d_%dHz.wav",
+                sh,smi,ss,cf); break;
     default: return FALSE;
     }
     wchar_t dir[MAX_PATH];
@@ -2981,6 +3133,7 @@ static BOOL build_cmdline(wchar_t *cmd,int n)
     else if(IsDlgButtonChecked(g_hwnd,ID_FMT_SDRCONNECT)) wcsncat(cmd,L" sdrconnect",n-wcslen(cmd)-1);
     else if(IsDlgButtonChecked(g_hwnd,ID_FMT_PERSEUS))    wcsncat(cmd,L" perseus",   n-wcslen(cmd)-1);
     else if(IsDlgButtonChecked(g_hwnd,ID_FMT_JAGUAR))     wcsncat(cmd,L" jaguar",    n-wcslen(cmd)-1);
+    else if(IsDlgButtonChecked(g_hwnd,ID_FMT_SDRSHARP))   wcsncat(cmd,L" sdrsharp",  n-wcslen(cmd)-1);
     if(IsDlgButtonChecked(g_hwnd,ID_DDC_CHECK)){
         /* cf in GUI is kHz; --ddc now takes Hz Hz */
         wchar_t cf_khz[16]={0}; wchar_t cf[32]={0},bw[32]={0};
@@ -3057,6 +3210,7 @@ static void build_op_desc(wchar_t *desc,int n)
     else if(IsDlgButtonChecked(g_hwnd,ID_FMT_SDRCONNECT)) fmt=L" \u2192 sdrconnect";
     else if(IsDlgButtonChecked(g_hwnd,ID_FMT_PERSEUS))    fmt=L" \u2192 perseus";
     else if(IsDlgButtonChecked(g_hwnd,ID_FMT_JAGUAR))     fmt=L" \u2192 jaguar";
+    else if(IsDlgButtonChecked(g_hwnd,ID_FMT_SDRSHARP))   fmt=L" \u2192 sdr#";
     wcsncat(parts,fmt,128-wcslen(parts)-1);
     /* DDC */
     if(IsDlgButtonChecked(g_hwnd,ID_DDC_CHECK)){
@@ -3090,9 +3244,10 @@ static void update_channel_controls(void)
         if(_wstat64(input,&st)==0 && st.st_size > 0){
             int ch = fi.dual ? 4 : 2;
             int bps = (fi.bits_per_sample > 0) ? (fi.bits_per_sample/8) : 2;
-            /* Header sizes per format: 0=Linrad,1=WavViewDX,2=SDRuno,3=SDRConnect,4=Perseus,5=Jaguar */
-            static const int hdr_sz[]={41,0,216,80,86,86};
-            int hs=(fi.fmt>=0&&fi.fmt<=5)?hdr_sz[fi.fmt]:86;
+            /* Header sizes per format: 0=Linrad,1=WavViewDX,2=SDRuno,3=SDRConnect,4=Perseus,5=Jaguar,6=SDRSharp */
+            /* SDRSharp RF64: RF64(12)+ds64(8+28)+fmt(8+16)+data(8) = 80 bytes */
+            static const int hdr_sz[]={41,0,216,80,86,86,80};
+            int hs=(fi.fmt>=0&&fi.fmt<=6)?hdr_sz[fi.fmt]:86;
             int64_t data_bytes = st.st_size - hs;
             if(data_bytes > 0)
                 dur_sec = (int)(data_bytes / ((int64_t)fi.sample_rate * ch * bps));
@@ -3103,8 +3258,8 @@ static void update_channel_controls(void)
             if(_wstat64(g_seq_paths[si],&st2)==0 && st2.st_size > 0){
                 int ch2 = fi.dual ? 4 : 2;
                 int bps2 = (fi.bits_per_sample > 0) ? (fi.bits_per_sample/8) : 2;
-                static const int hdr_sz2[]={41,0,216,80,86,86};
-                int hs2=(fi.fmt>=0&&fi.fmt<=5)?hdr_sz2[fi.fmt]:86;
+                static const int hdr_sz2[]={41,0,216,80,86,86,44};
+                int hs2=(fi.fmt>=0&&fi.fmt<=6)?hdr_sz2[fi.fmt]:86;
                 int64_t data_bytes2 = st2.st_size - hs2;
                 if(data_bytes2 > 0)
                     dur_sec += (int)(data_bytes2 / ((int64_t)fi.sample_rate * ch2 * bps2));
@@ -3229,6 +3384,7 @@ static void update_format_controls(void)
     EnableWindow(GetDlgItem(g_hwnd,ID_FMT_WAVVIEWDX),  TRUE);
     EnableWindow(GetDlgItem(g_hwnd,ID_FMT_SDRUNO),     TRUE);
     EnableWindow(GetDlgItem(g_hwnd,ID_FMT_SDRCONNECT), TRUE);
+    EnableWindow(GetDlgItem(g_hwnd,ID_FMT_SDRSHARP),   TRUE);
     EnableWindow(GetDlgItem(g_hwnd,ID_FMT_PERSEUS),    TRUE);
     EnableWindow(GetDlgItem(g_hwnd,ID_FMT_JAGUAR),     TRUE);
 
@@ -3247,7 +3403,7 @@ static void update_format_controls(void)
         for(int i=0;perseus_rates[i];i++) if(fi.sample_rate==perseus_rates[i]){ok_per=TRUE;break;}
         if(!ok_per){
             if(IsDlgButtonChecked(g_hwnd,ID_FMT_PERSEUS))
-                CheckRadioButton(g_hwnd,ID_FMT_SAME,ID_FMT_JAGUAR,ID_FMT_SAME);
+                CheckRadioButton(g_hwnd,ID_FMT_SAME,ID_FMT_SDRSHARP,ID_FMT_SAME);
             EnableWindow(GetDlgItem(g_hwnd,ID_FMT_PERSEUS), FALSE);
         }
         /* Jaguar output: available at any sample rate (resampler converts to 1,600,000 Hz)
@@ -3255,7 +3411,7 @@ static void update_format_controls(void)
         BOOL ok_jag = !IsDlgButtonChecked(g_hwnd,ID_DDC_CHECK); /* Jaguar available for passthrough at any rate */
         if(!ok_jag){
             if(IsDlgButtonChecked(g_hwnd,ID_FMT_JAGUAR))
-                CheckRadioButton(g_hwnd,ID_FMT_SAME,ID_FMT_JAGUAR,ID_FMT_SAME);
+                CheckRadioButton(g_hwnd,ID_FMT_SAME,ID_FMT_SDRSHARP,ID_FMT_SAME);
             EnableWindow(GetDlgItem(g_hwnd,ID_FMT_JAGUAR), FALSE);
         }
     }
@@ -3275,14 +3431,14 @@ static void update_format_controls(void)
         BOOL allow_jag = (fi.sample_rate == 2000000);
         if(!allow_jag){
             if(IsDlgButtonChecked(g_hwnd,ID_FMT_JAGUAR))
-                CheckRadioButton(g_hwnd,ID_FMT_SAME,ID_FMT_JAGUAR,ID_FMT_PERSEUS);
+                CheckRadioButton(g_hwnd,ID_FMT_SAME,ID_FMT_SDRSHARP,ID_FMT_PERSEUS);
         }
         EnableWindow(GetDlgItem(g_hwnd,ID_FMT_JAGUAR), allow_jag);
     } else if(fi.fmt==5){  /* Jaguar input */
         BOOL allow_per = (fi.sample_rate == 2000000);
         if(!allow_per){
             if(IsDlgButtonChecked(g_hwnd,ID_FMT_PERSEUS))
-                CheckRadioButton(g_hwnd,ID_FMT_SAME,ID_FMT_JAGUAR,ID_FMT_JAGUAR);
+                CheckRadioButton(g_hwnd,ID_FMT_SAME,ID_FMT_SDRSHARP,ID_FMT_JAGUAR);
         }
         EnableWindow(GetDlgItem(g_hwnd,ID_FMT_PERSEUS), allow_per);
     }
@@ -3305,7 +3461,7 @@ static void update_format_controls(void)
       if(!native_ddc){
           if(IsDlgButtonChecked(g_hwnd,ID_FMT_PERSEUS)||
              IsDlgButtonChecked(g_hwnd,ID_FMT_JAGUAR))
-              CheckRadioButton(g_hwnd,ID_FMT_SAME,ID_FMT_JAGUAR,ID_FMT_SAME);
+              CheckRadioButton(g_hwnd,ID_FMT_SAME,ID_FMT_SDRSHARP,ID_FMT_SAME);
           EnableWindow(GetDlgItem(g_hwnd,ID_FMT_PERSEUS), FALSE);
           EnableWindow(GetDlgItem(g_hwnd,ID_FMT_JAGUAR),  FALSE);
       }
@@ -3366,13 +3522,15 @@ static void update_format_controls(void)
         /* Disable WAV formats — they can't hold dual-tuner data */
         BOOL wav_sel = IsDlgButtonChecked(g_hwnd,ID_FMT_SDRUNO) ||
                        IsDlgButtonChecked(g_hwnd,ID_FMT_SDRCONNECT) ||
+                       IsDlgButtonChecked(g_hwnd,ID_FMT_SDRSHARP) ||
                        IsDlgButtonChecked(g_hwnd,ID_FMT_PERSEUS) ||
                        IsDlgButtonChecked(g_hwnd,ID_FMT_JAGUAR);
         if(wav_sel)
-            CheckRadioButton(g_hwnd,ID_FMT_SAME,ID_FMT_JAGUAR,
+            CheckRadioButton(g_hwnd,ID_FMT_SAME,ID_FMT_SDRSHARP,
                 fi.fmt==0?ID_FMT_LINRAD:ID_FMT_WAVVIEWDX);
         EnableWindow(GetDlgItem(g_hwnd,ID_FMT_SDRUNO),     FALSE);
         EnableWindow(GetDlgItem(g_hwnd,ID_FMT_SDRCONNECT), FALSE);
+        EnableWindow(GetDlgItem(g_hwnd,ID_FMT_SDRSHARP),   FALSE);
         EnableWindow(GetDlgItem(g_hwnd,ID_FMT_PERSEUS),    FALSE);
         EnableWindow(GetDlgItem(g_hwnd,ID_FMT_JAGUAR),     FALSE);
         /* "Same as input" for dual linrad/wavviewdx is only a no-op if no trim/ddc */
@@ -3383,7 +3541,7 @@ static void update_format_controls(void)
                 if(IsDlgButtonChecked(g_hwnd,ID_FMT_SAME)||
                    IsDlgButtonChecked(g_hwnd,noop_id)){
                     int other = (noop_id==ID_FMT_LINRAD)?ID_FMT_WAVVIEWDX:ID_FMT_LINRAD;
-                    CheckRadioButton(g_hwnd,ID_FMT_SAME,ID_FMT_JAGUAR,other);
+                    CheckRadioButton(g_hwnd,ID_FMT_SAME,ID_FMT_SDRSHARP,other);
                 }
                 EnableWindow(GetDlgItem(g_hwnd,noop_id),    FALSE);
                 EnableWindow(GetDlgItem(g_hwnd,ID_FMT_SAME),FALSE);
@@ -3422,15 +3580,16 @@ static void update_format_controls(void)
      * is now disabled (greyed out by rate rules above), fall back to Same as input. */
     BOOL any_checked = FALSE;
     int fmt_ids[]={ID_FMT_SAME,ID_FMT_LINRAD,ID_FMT_WAVVIEWDX,
-                   ID_FMT_SDRUNO,ID_FMT_SDRCONNECT,ID_FMT_PERSEUS,ID_FMT_JAGUAR};
-    for(int i=0;i<7;i++){
+                   ID_FMT_SDRUNO,ID_FMT_SDRCONNECT,ID_FMT_SDRSHARP,
+                   ID_FMT_PERSEUS,ID_FMT_JAGUAR};
+    for(int i=0;i<8;i++){
         if(IsDlgButtonChecked(g_hwnd,fmt_ids[i]) &&
            IsWindowEnabled(GetDlgItem(g_hwnd,fmt_ids[i]))){
             any_checked=TRUE; break;
         }
     }
     if(!any_checked)
-        CheckRadioButton(g_hwnd,ID_FMT_SAME,ID_FMT_JAGUAR,ID_FMT_SAME);
+        CheckRadioButton(g_hwnd,ID_FMT_SAME,ID_FMT_SDRSHARP,ID_FMT_SAME);
 }
 
 
@@ -3620,6 +3779,9 @@ static DWORD WINAPI batch_thread(LPVOID param)
 
         /* Mark running */
         PostMessageW(g_hwnd,WM_BATCHSTATUS,(WPARAM)i,(LPARAM)_wcsdup(L"Running"));
+
+        /* Update main window output label for this job */
+        PostMessageW(g_hwnd,WM_SETOUTLABEL,0,(LPARAM)_wcsdup(g_jobs[i].output_full));
 
         /* Log header */
         wchar_t hdr[4200];
@@ -4059,8 +4221,8 @@ static void create_controls(HWND hwnd)
         W-M-246,y+50,240,20,hwnd,(HMENU)(UINT_PTR)ID_SR_INFO,g_hinst,NULL);
       SendMessageW(hs,WM_SETFONT,(WPARAM)g_font,FALSE); }
     /* Sequence listbox */
-    { HWND hl=CreateWindowExW(WS_EX_CLIENTEDGE,L"LISTBOX",NULL,
-        WS_CHILD|WS_VISIBLE|WS_VSCROLL|LBS_NOTIFY|LBS_NOINTEGRALHEIGHT,
+    { HWND hl=CreateWindowExW(0,L"LISTBOX",NULL,
+        WS_CHILD|WS_VISIBLE|WS_VSCROLL|WS_BORDER|LBS_NOTIFY|LBS_NOINTEGRALHEIGHT,
         M+10,y+72,W-M*2-86,68,hwnd,(HMENU)(UINT_PTR)ID_SEQ_LIST,g_hinst,NULL);
       SendMessageW(hl,WM_SETFONT,(WPARAM)g_font_mono,FALSE); }
     mk_btn(hwnd,ID_SEQ_REMOVE,L"Remove",W-M-72,y+72,68,22,BS_PUSHBUTTON);
@@ -4112,24 +4274,28 @@ static void create_controls(HWND hwnd)
         (HINSTANCE)GetWindowLongPtrW(hwnd,GWLP_HINSTANCE),NULL);
       SetWindowPos(hbw,HWND_TOP,0,0,0,0,SWP_NOMOVE|SWP_NOSIZE); }
     y+=63;
-    { HWND hg=mk_group(hwnd,L"Output Format",M,y,W-M*2,72); SetWindowLongW(hg,GWLP_ID,ID_OUTFMT_GROUP); }
-    mk_radio(hwnd,ID_FMT_SAME,      L"Same as input", M+8,  y+22,120,20,TRUE);
-    mk_radio(hwnd,ID_FMT_LINRAD,    L"Linrad",         M+136,y+22, 62,20,FALSE);
-    mk_radio(hwnd,ID_FMT_WAVVIEWDX, L"WavViewDX",      M+206,y+22, 96,20,FALSE);
-    mk_radio(hwnd,ID_FMT_SDRUNO,    L"SDRuno",         M+310,y+22, 70,20,FALSE);
-    mk_radio(hwnd,ID_FMT_SDRCONNECT,L"SDR Connect",    M+388,y+22,106,20,FALSE);
-    mk_radio(hwnd,ID_FMT_PERSEUS,   L"Perseus",        M+502,y+22, 74,20,FALSE);
-    mk_radio(hwnd,ID_FMT_JAGUAR,    L"Jaguar",         M+584,y+22, 68,20,FALSE);
+    { HWND hg=mk_group(hwnd,L"Output Format",M,y,W-M*2,94); SetWindowLongW(hg,GWLP_ID,ID_OUTFMT_GROUP); }
+    /* 5 columns across W=820 client: x=20,188,356,524,692; w=152 */
+    /* Row 1: Same as input | Linrad | SDRuno | Perseus | SDR# */
+    mk_radio(hwnd,ID_FMT_SAME,      L"Same as input", M+8,  y+20,152,20,TRUE);
+    mk_radio(hwnd,ID_FMT_LINRAD,    L"Linrad",         M+176,y+20,152,20,FALSE);
+    mk_radio(hwnd,ID_FMT_SDRUNO,    L"SDRuno",         M+344,y+20,152,20,FALSE);
+    mk_radio(hwnd,ID_FMT_PERSEUS,   L"Perseus",        M+512,y+20,152,20,FALSE);
+    mk_radio(hwnd,ID_FMT_SDRSHARP,  L"SDR#",           M+680,y+20,112,20,FALSE);
+    /* Row 2: (gap) | WavViewDX | SDR Connect | Jaguar */
+    mk_radio(hwnd,ID_FMT_WAVVIEWDX, L"WavViewDX",      M+176,y+46,152,20,FALSE);
+    mk_radio(hwnd,ID_FMT_SDRCONNECT,L"SDR Connect",    M+344,y+46,152,20,FALSE);
+    mk_radio(hwnd,ID_FMT_JAGUAR,    L"Jaguar",         M+512,y+46,152,20,FALSE);
     /* Bit depth row — only visible for Perseus output */
     { HWND hl=CreateWindowExW(0,L"STATIC",L"Bit depth:",WS_CHILD|SS_LEFT,
-        M+8,y+46,74,20,hwnd,(HMENU)(UINT_PTR)ID_BIT_LABEL,g_hinst,NULL);
+        M+8,y+72,74,20,hwnd,(HMENU)(UINT_PTR)ID_BIT_LABEL,g_hinst,NULL);
       SendMessageW(hl,WM_SETFONT,(WPARAM)g_font,FALSE); }
     ShowWindow(GetDlgItem(hwnd,ID_BIT_LABEL),SW_HIDE);
-    mk_radio(hwnd,ID_OUT_16BIT,L"16-bit",M+84, y+46,60,20,TRUE);
-    mk_radio(hwnd,ID_OUT_24BIT,L"24-bit",M+150,y+46,60,20,FALSE);
+    mk_radio(hwnd,ID_OUT_16BIT,L"16-bit",M+84, y+72,60,20,TRUE);
+    mk_radio(hwnd,ID_OUT_24BIT,L"24-bit",M+150,y+72,60,20,FALSE);
     ShowWindow(GetDlgItem(hwnd,ID_OUT_16BIT),SW_HIDE);
     ShowWindow(GetDlgItem(hwnd,ID_OUT_24BIT),SW_HIDE);
-    y+=81;
+    y+=103;
 
     /* ── Predicted output label ── */
     HWND hpred=mk_static(hwnd,L"Output: (select input file)",M+2,y,W-M*2-4,18);
@@ -4149,7 +4315,7 @@ static void create_controls(HWND hwnd)
         W-M-90,lbl_y,90,lbl_h,hwnd,(HMENU)(INT_PTR)ID_ETA_STATIC,g_hinst,NULL);
     SendMessageW(heta,WM_SETFONT,(WPARAM)g_font,FALSE);
     int bar_x=M+40, bar_w=W-M-94-bar_x;
-    CreateWindowExW(WS_EX_CLIENTEDGE,L"STATIC",L"",WS_CHILD|WS_VISIBLE|SS_OWNERDRAW,
+    CreateWindowExW(0,L"STATIC",L"",WS_CHILD|WS_VISIBLE|WS_BORDER|SS_OWNERDRAW,
         bar_x,y,bar_w,prog_h,hwnd,(HMENU)(INT_PTR)ID_PROGRESS,g_hinst,NULL);
     y+=prog_h+8;
 
@@ -4165,7 +4331,7 @@ static void create_controls(HWND hwnd)
     EnableWindow(GetDlgItem(hwnd,ID_START_EDIT),FALSE);
     EnableWindow(GetDlgItem(hwnd,ID_END_EDIT),  FALSE);
     CheckRadioButton(hwnd,ID_CHAN_DUAL,ID_CHAN_CH2,ID_CHAN_DUAL);
-    CheckRadioButton(hwnd,ID_FMT_SAME,ID_FMT_JAGUAR,ID_FMT_SAME);
+    CheckRadioButton(hwnd,ID_FMT_SAME,ID_FMT_SDRSHARP,ID_FMT_SAME);
     EnableWindow(GetDlgItem(hwnd,ID_DDC_CENTRE),FALSE);
     EnableWindow(GetDlgItem(hwnd,ID_DDC_BW),    FALSE);
     EnableWindow(GetDlgItem(hwnd,ID_CANCEL),    FALSE);
@@ -4488,6 +4654,7 @@ static void show_log_window(void)
             WS_CHILD|WS_VISIBLE|WS_VSCROLL|ES_MULTILINE|ES_READONLY|ES_AUTOVSCROLL,
             8,8,644,340,g_hwnd_log,(HMENU)(INT_PTR)ID_LOG_EDIT,g_hinst,NULL);
         SendMessageW(he,WM_SETFONT,(WPARAM)g_font_mono,FALSE);
+        SendMessageW(he,EM_SETLIMITTEXT,2*1024*1024,0); /* 2 MB limit */
 
         /* Clear button */
         HWND hc=CreateWindowExW(0,L"BUTTON",L"Clear Log",
@@ -4570,6 +4737,11 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp)
         SetBkColor((HDC)wp,RGB(255,255,255));
         return (LRESULT)GetStockObject(WHITE_BRUSH);
 
+    case WM_CTLCOLORLISTBOX:
+        SetBkColor((HDC)wp,RGB(255,255,255));
+        SetTextColor((HDC)wp,RGB(0,0,0));
+        return (LRESULT)GetStockObject(WHITE_BRUSH);
+
     case WM_CTLCOLORSTATIC:{
         wchar_t cls[16]; GetClassNameW((HWND)lp,cls,16);
         if(_wcsicmp(cls,L"EDIT")==0){
@@ -4607,7 +4779,7 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp)
             SetTextColor(di->hDC,CLR_HEADER_TEXT);
             if(g_font_title) SelectObject(di->hDC,g_font_title);
             RECT tr=di->rcItem; tr.left+=14;
-            DrawTextW(di->hDC,L"SDR Trim  v1.7.0",-1,&tr,DT_LEFT|DT_VCENTER|DT_SINGLELINE);
+            DrawTextW(di->hDC,L"SDR Trim  v1.7.1",-1,&tr,DT_LEFT|DT_VCENTER|DT_SINGLELINE);
             /* Name on right — use normal font, slightly smaller */
             if(g_font) SelectObject(di->hDC,g_font);
             RECT nr=di->rcItem; nr.right-=14;
@@ -4704,12 +4876,13 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp)
         case ID_CHAN_DUAL: case ID_CHAN_CH1: case ID_CHAN_CH2:
             update_channel_controls(); update_format_controls(); update_prediction(); break;
         case ID_FMT_SAME: case ID_FMT_LINRAD: case ID_FMT_WAVVIEWDX:
-        case ID_FMT_SDRUNO: case ID_FMT_SDRCONNECT:
+        case ID_FMT_SDRUNO: case ID_FMT_SDRCONNECT: case ID_FMT_SDRSHARP:
         case ID_FMT_PERSEUS: case ID_FMT_JAGUAR:
             /* Manually enforce mutual exclusion across full format group */
             { int fmts[]={ID_FMT_SAME,ID_FMT_LINRAD,ID_FMT_WAVVIEWDX,
-                           ID_FMT_SDRUNO,ID_FMT_SDRCONNECT,ID_FMT_PERSEUS,ID_FMT_JAGUAR};
-              for(int fi=0;fi<7;fi++)
+                           ID_FMT_SDRUNO,ID_FMT_SDRCONNECT,ID_FMT_SDRSHARP,
+                           ID_FMT_PERSEUS,ID_FMT_JAGUAR};
+              for(int fi=0;fi<8;fi++)
                   SendDlgItemMessageW(hwnd,fmts[fi],BM_SETCHECK,
                       fmts[fi]==LOWORD(wp)?BST_CHECKED:BST_UNCHECKED,0);
             }
@@ -4796,7 +4969,6 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp)
             }
             {
                 g_yes_to_all=FALSE;
-                show_log_window();
                 ThreadArgs *args=(ThreadArgs*)malloc(sizeof(ThreadArgs));
                 if(!args) break;
                 if(!build_cmdline(args->cmdline,4096)){ free(args); break; }
@@ -4883,7 +5055,6 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp)
         case ID_RUN_BATCH:
             if(g_running||g_job_count==0) break;
             g_yes_to_all=FALSE;
-            show_log_window();
             {
                 /* Check for output files that already exist */
                 wchar_t conflict_list[4096]={0};
@@ -5008,6 +5179,19 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp)
         }
         return 0;
 
+    case WM_SETOUTLABEL:{
+            wchar_t *path=(wchar_t*)lp;
+            if(path){
+                wchar_t label[MAX_PATH+16];
+                const wchar_t *fn=wcsrchr(path,L'\\');
+                _snwprintf(label,MAX_PATH+16,L"Output: %s",fn?fn+1:path);
+                SetWindowTextW(GetDlgItem(hwnd,ID_OUTFILE_STATIC),label);
+                InvalidateRect(GetDlgItem(hwnd,ID_OUTFILE_STATIC),NULL,TRUE);
+                free(path);
+            }
+        }
+        return 0;
+
     case WM_CONFIRM_OW:{
             wchar_t *path=(wchar_t*)lp;
             wchar_t *fn=wcsrchr(path,L'\\');
@@ -5090,6 +5274,24 @@ int WINAPI wWinMain(HINSTANCE hi,HINSTANCE hp,LPWSTR lp,int ns)
 
     SetProcessDPIAware();
 
+    /* Force light mode for the whole app so the common file dialog and
+       other system UI stay light even when Windows dark mode is on.
+       SetPreferredAppMode(ForcedLight=1) is ordinal 135 in uxtheme.dll
+       (Windows 10 1903+). Load dynamically so we don't break on older OS. */
+    {
+        HMODULE hux = LoadLibraryW(L"uxtheme.dll");
+        if(hux){
+            typedef int (WINAPI *PFNSPAM)(int);
+            PFNSPAM fn = (PFNSPAM)(void*)GetProcAddress(hux,(LPCSTR)(INT_PTR)135);
+            if(fn) fn(1); /* 1 = ForcedLight */
+            /* FlushMenuThemes() at ordinal 136 applies it immediately */
+            typedef void (WINAPI *PFNFMT)(void);
+            PFNFMT fmf = (PFNFMT)(void*)GetProcAddress(hux,(LPCSTR)(INT_PTR)136);
+            if(fmf) fmf();
+            FreeLibrary(hux);
+        }
+    }
+
     INITCOMMONCONTROLSEX icc={sizeof(icc),
         ICC_STANDARD_CLASSES|ICC_WIN95_CLASSES|ICC_LISTVIEW_CLASSES|ICC_BAR_CLASSES};
     InitCommonControlsEx(&icc);
@@ -5107,7 +5309,7 @@ int WINAPI wWinMain(HINSTANCE hi,HINSTANCE hp,LPWSTR lp,int ns)
     RECT rc={0,0,cw,ch};
     AdjustWindowRect(&rc,WS_OVERLAPPED|WS_CAPTION|WS_SYSMENU|WS_MINIMIZEBOX,FALSE);
     int ww=rc.right-rc.left, wh=rc.bottom-rc.top;
-    int sx=(GetSystemMetrics(SM_CXSCREEN)-ww)/2;
+    int sx=(GetSystemMetrics(SM_CXSCREEN)-ww)/3;  /* left of centre leaves room for batch/log */
     int sy=(GetSystemMetrics(SM_CYSCREEN)-wh)/2;
 
     /* Restore saved window size if available */
