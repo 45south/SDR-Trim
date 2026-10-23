@@ -1,13 +1,13 @@
-# SDR Trim  v1.6.3
+# SDR Trim  v1.7.1
 
-IQ recording utility for SDRplay RSPdx, RSPduo, Perseus, and Jaguar receivers.
+IQ trimming utility for SDRplay RSPdx, RSPduo, Perseus, and Jaguar receivers.
 
 **Trim · Convert · Extract · DDC**
 
 ## Features
 
 - Time trim to second precision (HHMMSS)
-- Format conversion between Linrad raw, WavViewDX raw, SDRuno WAV, SDR Connect WAV, Perseus WAV, and Jaguar WAV
+- Format conversion between Linrad raw, WavViewDX raw, SDRuno WAV, SDR Connect WAV, SDR#, Perseus WAV, and Jaguar WAV
 - Dual-tuner channel extraction (Tuner A / Tuner B) from RSPduo recordings
 - Digital Down-Conversion (DDC) — extract a narrow frequency slice at a reduced sample rate
 - Sequential recording — join multiple consecutive SDRuno WAV files and trim/convert across file boundaries
